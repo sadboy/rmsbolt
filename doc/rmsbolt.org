@@ -254,6 +254,12 @@ Rust looks for a ~Cargo.toml~ file in any directory higher than the source
 file. When it finds one, it invokes ~cargo~ to get the ~rustc~ compilation
 command and working directory for the target that owns the current source file.
 
+For ~build.rs~ files, Cargo prints the ~rustc~ command only when the build
+script is not already compiled. Set ~rmsbolt-cargo-force-build-script~ to ~t~
+to update the modification time of ~build.rs~ before RMSBolt queries Cargo.
+Note that this invalidates the build-script fingerprint and causes Cargo to
+rebuild downstream targets.
+
 * Developing
 
 These are some tips which will help people working on developing or customizing RMSbolt.

@@ -127,6 +127,16 @@ manually saved, set to `on-save'."
                  (const :tag "On" t)
                  (const :tag "Always" force)))
 
+
+(defcustom rmsbolt-cargo-force-build-script nil
+  "Whether to update the timestamp of a Cargo build script before compilation.
+When non-nil, RMSBolt updates the modification time of `build.rs' so
+Cargo prints the `rustc' command even when the build script is already
+built.  This invalidates the build-script fingerprint and causes Cargo
+to rebuild downstream targets."
+  :group 'rmsbolt
+  :type 'boolean
+  :safe 'booleanp)
 ;;;;; Buffer Local Tweakables
 (defcustom rmsbolt-disassemble nil
   "Whether we should disassemble an output binary."
@@ -1205,8 +1215,12 @@ If BUILD-SCRIPT-P is non-nil, match the build script command."
                  cmd-err
                  (output
                   (with-temp-buffer
-                    (when build-script-p
-                      (ignore-errors (set-file-times (concat remote file))))
+                    (when (and build-script-p rmsbolt-cargo-force-build-script)
+                      (condition-case err
+                          (set-file-times (concat remote file))
+                        (error
+                         (message "RMSBolt: could not update timestamp of %s: %s"
+                                  file (error-message-string err)))))
                     (if (zerop (condition-case err
                                    (apply #'process-file "cargo" nil t nil cargo-args)
                                  (error
@@ -1223,6 +1237,10 @@ If BUILD-SCRIPT-P is non-nil, match the build script command."
              (cmd-err
               (message "RMSBolt: Cargo integration failed: %s"
                        (rmsbolt--cargo-format-error cmd-err))
+              nil)
+             ((and build-script-p (not rmsbolt-cargo-force-build-script))
+              (message "RMSBolt: Cargo integration failed: build script for %s is already fresh (customize `rmsbolt-cargo-force-build-script' to force)"
+                       pkg-name)
               nil)
              (t
               (message "RMSBolt: Cargo integration failed: could not extract rustc command for %s"
