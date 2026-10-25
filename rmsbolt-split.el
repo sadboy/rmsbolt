@@ -27,17 +27,14 @@
 ;; gcc -o one two -c -S
 ;; This library tries to make it possible to remove '-o one' '-c' and '-S'.
 ;;
-;; This is not easy to do without bugs, and therefore this is mostly incomplete.
-;; Hopefully we will never see more complicated formats (such as quoted arguments)
-;; in generated commands, or we will need to write a parser.
+;; The tokenizer splits a command string into shell words and keeps
+;; single-quoted strings, double-quoted strings, and backslash escapes intact.
 
 ;;; Requires:
 
 (require 'cl-lib)
 
 ;;; Variables
-
-(defvar rmsbolt-split--regexp (rx (1+ blank)))
 
 (defvar rmsbolt-split--token-regexp
   (rx (1+ (or (seq "'" (0+ (not (any "'"))) "'")
@@ -46,12 +43,14 @@
                    "\"")
               (seq "\\" anything)
               (not (any blank "\n" "'" "\"" "\\"))
-              "'" "\""))))
+              "'" "\"" "\\"))))
 
 ;;; Code:
 
 (defun rmsbolt-split--tokenize (cmd)
-  "Split CMD into shell tokens and keep quoted strings intact."
+  "Split CMD into shell-word tokens.
+Adjacent quoted and unquoted segments (such as `KEY=\\='a b\\='') stay in
+one token."
   (let ((pos 0)
         tokens)
     (save-match-data
@@ -87,6 +86,7 @@ matches ARG with COMPARATOR."
             (pop cmd)
           (push f res))))
     (mapconcat #'identity (nreverse res) " ")))
+
 (provide 'rmsbolt-split)
 
 ;;; rmsbolt-split.el ends here
