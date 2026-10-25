@@ -1189,15 +1189,27 @@ Optional hash table ROOT-CACHE caches sanitized file contents by ROOT-FILE."
                      (file-name-nondirectory local-file)))
           best-match))))
 
-(defun rmsbolt--extract-cargo-rustc-cmd (output &optional build-script-p)
-  "Extract the `rustc' command from `cargo -vv' OUTPUT.
-If BUILD-SCRIPT-P is non-nil, match the build script command."
+(defun rmsbolt--extract-cargo-rustc-cmd (output &optional crate-name)
+  "Extract the `rustc' command for CRATE-NAME from `cargo -vv' OUTPUT.
+CRATE-NAME may be a target name string, t for `build_script_build', or
+nil to match the last `rustc' invocation."
+  ;; Cargo prints `Running `<env> rustc --crate-name <name> ...`' on stderr.
+  ;; Environment variables can contain line breaks, so search backward for the
+  ;; last line of the target command (which ends with a backtick).
+  ;; Then search backward for the opening `Running `' prefix.
   (with-temp-buffer
     (insert output)
     (goto-char (point-max))
-    (let ((pattern (if build-script-p
-                       (rx "--crate-name" (1+ space) "build_script_build" (0+ nonl) "`" line-end)
-                     (rx "--print" (1+ space) "crate-name" (0+ nonl) "`" line-end))))
+    (let* ((expected (cond
+                      ((eq crate-name t) "build_script_build")
+                      ((stringp crate-name)
+                       (replace-regexp-in-string "-" "_" crate-name))
+                      (t nil)))
+           (pattern (if expected
+                        (rx "--crate-name" (1+ space) (literal expected)
+                            symbol-end (0+ nonl) "`" line-end)
+                      (rx "--crate-name" (1+ space) (1+ (or alnum "_"))
+                          (0+ nonl) "`" line-end))))
       (when (re-search-backward pattern nil t)
         (let ((cmd-end (1- (match-end 0))))
           (when (re-search-backward (rx line-start (0+ blank) "Running `") nil t)
@@ -1363,7 +1375,11 @@ If BUILD-SCRIPT-P is non-nil, match the build script command."
                                     (setq cmd-err (buffer-string))
                                     nil)))
                                (raw-cmd (and output
-                                             (rmsbolt--extract-cargo-rustc-cmd output build-script-p))))
+                                             (rmsbolt--extract-cargo-rustc-cmd
+                                              output
+                                              (if build-script-p
+                                                  "build_script_build"
+                                                (alist-get 'name target))))))
                           (cond
                            (raw-cmd
                             (let ((res (list workspace-dir (rmsbolt--clean-cargo-rustc-cmd raw-cmd))))
