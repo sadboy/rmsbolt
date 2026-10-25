@@ -2356,6 +2356,8 @@ Are you running two compilations at the same time?"))
 (defvar rmsbolt-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'rmsbolt-compile)
+    (define-key map (kbd "C-c C-n") #'rmsbolt-output-forward-chunk)
+    (define-key map (kbd "C-c C-p") #'rmsbolt-output-backward-chunk)
     map)
   "Keymap for function `rmsbolt-mode'.")
 
@@ -2438,6 +2440,103 @@ Uses LANG-NAME to determine the language."
       (find-file file-name)
       (unless rmsbolt-mode
         (rmsbolt-mode 1)))))
+
+;;;; Output Chunk Navigation
+
+(defun rmsbolt--output-chunks (src-buffer src-line)
+  "Return the assembly chunks mapped to SRC-LINE in SRC-BUFFER.
+The chunks are ordered by their start line.  Each chunk is a cons of its
+first and last line number in the rmsbolt output buffer."
+  (let ((mapping (and (buffer-live-p src-buffer)
+                      (buffer-local-value 'rmsbolt-line-mapping src-buffer))))
+    (when mapping
+      (sort (copy-sequence (gethash src-line mapping))
+            (lambda (a b) (< (car a) (car b)))))))
+
+(defun rmsbolt--output-chunk-at-line (line chunks)
+  "Return the chunk from CHUNKS that contains LINE, or nil."
+  (cl-find-if (lambda (chunk) (<= (car chunk) line (cdr chunk))) chunks))
+
+(defun rmsbolt--output-focus-line (output-buffer)
+  "Return the line in OUTPUT-BUFFER that currently has focus."
+  (with-current-buffer output-buffer
+    (line-number-at-pos
+     (if-let* ((window (get-buffer-window output-buffer 'visible)))
+         (window-point window)
+       (point)))))
+
+(defun rmsbolt--output-focus-chunk (chunk output-buffer)
+  "Move the focus in OUTPUT-BUFFER to the start of CHUNK."
+  (if-let* ((window (get-buffer-window output-buffer 'visible)))
+      (with-selected-window window
+        (goto-char (point-min))
+        (forward-line (1- (car chunk)))
+        (recenter))
+    (with-current-buffer output-buffer
+      (goto-char (point-min))
+      (forward-line (1- (car chunk))))))
+
+(defun rmsbolt--output-cycle-chunk (step)
+  "Cycle the rmsbolt output focus through the chunks of the current line.
+The current line is the source line at point in the rmsbolt output
+buffer, or the line at point in its source buffer.  STEP is 1 to move to
+the next chunk and -1 to move to the previous one.  Cycling wraps around
+at either end."
+  (let* ((output-buffer (get-buffer rmsbolt-output-buffer))
+         (src-buffer (and output-buffer
+                          (buffer-local-value 'rmsbolt-src-buffer output-buffer)))
+         (in-output (eq (current-buffer) output-buffer))
+         (in-source (and rmsbolt-mode
+                         src-buffer
+                         (eq (current-buffer) src-buffer))))
+    (unless (or in-output in-source)
+      (user-error "This buffer is not linked to the rmsbolt output buffer"))
+    (unless (buffer-live-p src-buffer)
+      (user-error "The rmsbolt output buffer has no live source buffer"))
+    (let* ((src-line (if in-output
+                         (or (get-text-property (point) 'rmsbolt-src-line)
+                             (get-text-property (line-beginning-position)
+                                                'rmsbolt-src-line))
+                       (line-number-at-pos)))
+           (chunks (and src-line (rmsbolt--output-chunks src-buffer src-line))))
+      (unless chunks
+        (user-error "No assembly mapped to the current line"))
+      (let ((count (length chunks)))
+        (if (= count 1)
+            (message "Source line %d maps to a single assembly chunk" src-line)
+          (let* ((current (rmsbolt--output-chunk-at-line
+                           (if in-output
+                               (line-number-at-pos)
+                             (rmsbolt--output-focus-line output-buffer))
+                           chunks))
+                 (index (if current
+                            (cl-position current chunks :test #'eq)
+                          (if (< step 0) count -1)))
+                 (next-index (mod (+ index step) count))
+                 (chunk (nth next-index chunks)))
+            (rmsbolt--output-focus-chunk chunk output-buffer)
+            (message "Assembly chunk %d/%d for source line %d"
+                     (1+ next-index) count src-line)))))))
+
+;;;###autoload
+(defun rmsbolt-output-forward-chunk ()
+  "Move to the next assembly chunk of the current source line.
+A source line can compile to several disjoint chunks of assembly.  This
+command cycles the rmsbolt output focus through them and wraps around
+after the last chunk.  It works in the output buffer and in the source
+buffer under `rmsbolt-mode'."
+  (interactive)
+  (rmsbolt--output-cycle-chunk 1))
+
+;;;###autoload
+(defun rmsbolt-output-backward-chunk ()
+  "Move to the previous assembly chunk of the current source line.
+A source line can compile to several disjoint chunks of assembly.  This
+command cycles the rmsbolt output focus through them and wraps around
+before the first chunk.  It works in the output buffer and in the source
+buffer under `rmsbolt-mode'."
+  (interactive)
+  (rmsbolt--output-cycle-chunk -1))
 
 ;;;; Overlay Commands
 (defun rmsbolt--goto-line (line)
