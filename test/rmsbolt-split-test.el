@@ -62,6 +62,18 @@
             "/usr/bin/c++   -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORK_LIB -DQT_NO_KEYWORDS -DQT_WIDGETS_LIB -Isrc/googletest/include -I../common -Icommon -Icommon/protobuf -isystem /usr/include/x86_64-linux-gnu/qt5 -isystem /usr/include/x86_64-linux-gnu/qt5/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt5/mkspecs/linux-g++-64 -isystem /usr/include/x86_64-linux-gnu/qt5/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt5/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt5/QtGui   -Werror=return-local-addr -fPIC -g -g -Og -Werror=return-type -Werror=delete-non-virtual-dtor   -fPIC -std=gnu++14 -o common/CMakeFiles/common.dir/Geometry2d/Arc.cpp.o -c /home/jay/Code/robocup-software/common/Geometry2d/Arc.cpp" "-o")
            "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORK_LIB -DQT_NO_KEYWORDS -DQT_WIDGETS_LIB -Isrc/googletest/include -I../common -Icommon -Icommon/protobuf -isystem /usr/include/x86_64-linux-gnu/qt5 -isystem /usr/include/x86_64-linux-gnu/qt5/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt5/mkspecs/linux-g++-64 -isystem /usr/include/x86_64-linux-gnu/qt5/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt5/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt5/QtGui -Werror=return-local-addr -fPIC -g -g -Og -Werror=return-type -Werror=delete-non-virtual-dtor -fPIC -std=gnu++14 -c /home/jay/Code/robocup-software/common/Geometry2d/Arc.cpp")))
 
+  (should (equal
+           (rmsbolt-split-rm-double
+            "rustc -C embed-bitcode=no -C extra-filename=-123 -C linker=clang"
+            "-C" "extra-filename=" #'string-prefix-p)
+           "rustc -C embed-bitcode=no -C linker=clang"))
+
+  (should (equal
+           (rmsbolt-split-rm-double
+            "CARGO_PKG_DESCRIPTION='A  multi-space desc' rustc --out-dir '/tmp/with spaces' --crate-type lib"
+            "--out-dir")
+           "CARGO_PKG_DESCRIPTION='A  multi-space desc' rustc --crate-type lib"))
+
 (provide 'rmsbolt-split-test)
 
 ;;; rmsbolt-split-test.el ends here

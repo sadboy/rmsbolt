@@ -612,7 +612,8 @@ Use SRC-BUFFER as buffer containing local variables."
 Use SRC-BUFFER as buffer for local variables."
   (rmsbolt--with-local-files
    src-buffer
-   (let* ((asm-format (buffer-local-value 'rmsbolt-asm-format src-buffer))
+   (let* ((no-src-filename (rmsbolt--handle-rust-compile-cmd src-buffer))
+          (asm-format (buffer-local-value 'rmsbolt-asm-format src-buffer))
           (disass (buffer-local-value 'rmsbolt-disassemble src-buffer))
           (cmd (buffer-local-value 'rmsbolt-command src-buffer))
           (cmd (string-join
@@ -622,14 +623,15 @@ Use SRC-BUFFER as buffer for local variables."
                       (if disass
                           "link"
                         "asm")
-                      src-filename
+                      (if no-src-filename
+                          ""
+                        src-filename)
                       "-o" output-filename
                       (when (and (not (booleanp asm-format))
                                  (not disass))
                         (concat "-Cllvm-args=--x86-asm-syntax=" asm-format)))
                 " ")))
      cmd)))
-
 (cl-defun rmsbolt--go-compile-cmd (&key src-buffer)
   "Process a compile command for go.
 
@@ -969,6 +971,230 @@ return t if successful."
                                 (rmsbolt-split-rm-double "-o")))
       t)))
 
+
+(defun rmsbolt--cargo-target-kind-priority (kinds)
+  "Return the selection priority for Cargo target KINDS."
+  (cond
+   ((cl-some (lambda (k)
+               (member k '("lib" "rlib" "dylib" "cdylib" "staticlib" "proc-macro")))
+             kinds)
+    6)
+   ((cl-find "bin" kinds :test #'string=) 5)
+   ((cl-find "test" kinds :test #'string=) 4)
+   ((cl-find "example" kinds :test #'string=) 3)
+   ((cl-find "bench" kinds :test #'string=) 2)
+   ((cl-find "custom-build" kinds :test #'string=) 1)
+   (t 0)))
+
+(defun rmsbolt--cargo-target-args (target)
+  "Return `cargo rustc' target flags for TARGET, or `custom-build'."
+  (let ((kinds (alist-get 'kind target))
+        (name (alist-get 'name target))
+        (req-features (alist-get 'required-features target)))
+    (if (cl-find "custom-build" kinds :test #'string=)
+        'custom-build
+      (let ((base-args
+             (cond
+              ((cl-some (lambda (k)
+                          (member k '("lib" "rlib" "dylib" "cdylib" "staticlib" "proc-macro")))
+                        kinds)
+               '("--lib"))
+              ((cl-find "bin" kinds :test #'string=)
+               (list "--bin" name))
+              ((cl-find "test" kinds :test #'string=)
+               (list "--test" name))
+              ((cl-find "example" kinds :test #'string=)
+               (list "--example" name))
+              ((cl-find "bench" kinds :test #'string=)
+               (list "--bench" name)))))
+        (if (and base-args (> (length req-features) 0))
+            (append base-args (list "--features" (mapconcat #'identity req-features ",")))
+          base-args)))))
+
+(defun rmsbolt--cargo-score-less-p (a b)
+  "Return non-nil if score list A is lexicographically less than B."
+  (cl-loop for x in a
+           for y in b
+           when (/= x y)
+           return (< x y)))
+
+(defun rmsbolt--cargo-root-declares-mod-p (root-file mod-name rel-path)
+  "Return non-nil if ROOT-FILE references MOD-NAME or REL-PATH."
+  (when (and root-file (file-readable-p root-file))
+    (with-temp-buffer
+      (insert-file-contents root-file)
+      (or (re-search-forward
+           (concat "\\_<mod[[:space:]]+\\(?:r#\\)?" (regexp-quote mod-name) "\\_>")
+           nil t)
+          (save-excursion
+            (goto-char (point-min))
+            (search-forward rel-path nil t))))))
+
+(defun rmsbolt--cargo-find-target (metadata file &optional remote-prefix)
+  "Find the best `(PKG . TARGET)' in Cargo METADATA for local FILE."
+  (let* ((remote (or remote-prefix ""))
+         (true-file (file-local-name (file-truename (concat remote file))))
+         (packages (alist-get 'packages metadata))
+         exact-match
+         exact-prio
+         best-match
+         best-score)
+    (cl-loop for pkg across packages do
+             (let ((pkg-dir (file-name-directory
+                             (file-local-name
+                              (file-truename
+                               (concat remote (alist-get 'manifest_path pkg)))))))
+               (cl-loop for target across (alist-get 'targets pkg) do
+                        (let* ((target-src (file-local-name
+                                            (file-truename
+                                             (concat remote (alist-get 'src_path target)))))
+                               (prio (rmsbolt--cargo-target-kind-priority
+                                      (alist-get 'kind target))))
+                          (if (equal true-file target-src)
+                              (when (or (not exact-prio) (> prio exact-prio))
+                                (setq exact-match (cons pkg target)
+                                      exact-prio prio))
+                            (let* ((target-dir (file-name-directory target-src))
+                                   (target-nondir (file-name-nondirectory target-src))
+                                   (target-stem-dir (file-name-as-directory
+                                                     (file-name-sans-extension target-src)))
+                                   (dir-score
+                                    (cond
+                                     ((and (not (member target-nondir '("lib.rs" "main.rs" "mod.rs")))
+                                           (string-prefix-p target-stem-dir true-file))
+                                      (1+ (length target-stem-dir)))
+                                     ((string-prefix-p target-dir true-file)
+                                      (length target-dir))
+                                     ((string-prefix-p pkg-dir true-file)
+                                      (length pkg-dir))
+                                     (t 0))))
+                              (when (> dir-score 0)
+                                (let* ((rel (and (string-prefix-p target-dir true-file)
+                                                 (file-relative-name true-file target-dir)))
+                                       (top-mod (and rel
+                                                     (car (split-string
+                                                           (file-name-sans-extension rel) "/"))))
+                                       (mod-match
+                                        (if (and top-mod
+                                                 (rmsbolt--cargo-root-declares-mod-p
+                                                  (concat remote target-src) top-mod rel))
+                                            1
+                                          0))
+                                       (score (list (length pkg-dir) dir-score mod-match prio)))
+                                  (when (or (not best-score)
+                                            (rmsbolt--cargo-score-less-p best-score score))
+                                    (setq best-match (cons pkg target)
+                                          best-score score))))))))))
+    (or exact-match best-match)))
+
+(defun rmsbolt--extract-cargo-rustc-cmd (output &optional build-script-p)
+  "Extract the `rustc' command from `cargo -vv' OUTPUT.
+If BUILD-SCRIPT-P is non-nil, match the build script command."
+  (with-temp-buffer
+    (insert output)
+    (goto-char (point-max))
+    (let ((pattern (if build-script-p
+                       (rx "--crate-name" (1+ space) "build_script_build" (0+ nonl) "`" line-end)
+                     (rx "--print" (1+ space) "crate-name" (0+ nonl) "`" line-end))))
+      (when (re-search-backward pattern nil t)
+        (let ((cmd-end (1- (match-end 0))))
+          (when (re-search-backward (rx line-start (0+ blank) "Running `") nil t)
+            (buffer-substring-no-properties (match-end 0) cmd-end)))))))
+
+(defun rmsbolt--clean-cargo-rustc-cmd (cmd)
+  "Remove Cargo flags from CMD that conflict with RMSBolt output."
+  (let ((cleaned
+         (thread-first cmd
+                       (rmsbolt-split-rm-double "--print")
+                       (rmsbolt-split-rm-single "--print=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "--emit")
+                       (rmsbolt-split-rm-single "--emit=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "--out-dir")
+                       (rmsbolt-split-rm-single "--out-dir=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "-o")
+                       (rmsbolt-split-rm-double "--error-format")
+                       (rmsbolt-split-rm-single "--error-format=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "--json")
+                       (rmsbolt-split-rm-single "--json=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "-C" "extra-filename=" #'string-prefix-p)
+                       (rmsbolt-split-rm-single "-Cextra-filename=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "-C" "incremental=" #'string-prefix-p)
+                       (rmsbolt-split-rm-single "-Cincremental=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "-C" "debuginfo=" #'string-prefix-p)
+                       (rmsbolt-split-rm-single "-Cdebuginfo=" #'string-prefix-p)
+                       (rmsbolt-split-rm-double "-C" "lto" #'string-prefix-p)
+                       (rmsbolt-split-rm-single "-Clto" #'string-prefix-p))))
+    (if (string-match-p (rx bos (1+ (any "A-Za-z0-9_-")) "=") cleaned)
+        (concat "env " cleaned)
+      cleaned)))
+
+(defun rmsbolt--parse-cargo-compile-cmd (manifest-dir file)
+  "Invoke Cargo in MANIFEST-DIR and extract the compile dir and command for FILE."
+  (let* ((default-directory manifest-dir)
+         (remote (file-remote-p manifest-dir))
+         (json-object-type 'alist)
+         (json-array-type 'vector)
+         (metadata
+          (with-temp-buffer
+            (when (zerop (condition-case nil
+                             (process-file "cargo" nil (list (current-buffer) nil) nil
+                                           "metadata" "--no-deps" "--format-version" "1")
+                           (error 1)))
+              (goto-char (point-min))
+              (condition-case nil
+                  (json-read)
+                (error nil))))))
+    (when-let* ((workspace-root (alist-get 'workspace_root metadata))
+               (workspace-dir (concat remote (file-name-as-directory workspace-root)))
+               (match (rmsbolt--cargo-find-target metadata file remote))
+               (pkg (car match))
+               (target (cdr match))
+               (pkg-name (alist-get 'name pkg))
+               (target-args (rmsbolt--cargo-target-args target)))
+      (let* ((default-directory workspace-dir)
+             (build-script-p (eq target-args 'custom-build))
+             (cargo-args
+              (if build-script-p
+                  (let ((other-args
+                         (cl-loop for tgt across (alist-get 'targets pkg)
+                                  for args = (rmsbolt--cargo-target-args tgt)
+                                  when (and args (not (eq args 'custom-build)))
+                                  return args)))
+                    (if other-args
+                        (append (list "rustc" "-p" pkg-name)
+                                other-args
+                                '("-vv" "--" "--print" "crate-name"))
+                      (list "check" "-p" pkg-name "-vv")))
+                (append (list "rustc" "-p" pkg-name)
+                        target-args
+                        '("-vv" "--" "--print" "crate-name"))))
+             (output
+              (with-temp-buffer
+                (when build-script-p
+                  (ignore-errors (set-file-times (concat remote file))))
+                (when (zerop (condition-case nil
+                                 (apply #'process-file "cargo" nil t nil cargo-args)
+                               (error 1)))
+                  (buffer-string))))
+             (raw-cmd (and output
+                           (rmsbolt--extract-cargo-rustc-cmd output build-script-p))))
+        (when raw-cmd
+          (list workspace-dir (rmsbolt--clean-cargo-rustc-cmd raw-cmd)))))))
+
+(defun rmsbolt--handle-rust-compile-cmd (src-buffer)
+  "Handle Cargo integration for Rust for a given SRC-BUFFER.
+Return t if successful."
+  (when-let* ((defaults (buffer-local-value 'rmsbolt--default-variables src-buffer))
+             (default-dir (cl-find 'rmsbolt-default-directory defaults))
+             (default-cmd (cl-find 'rmsbolt-command defaults))
+             (src-file (buffer-file-name src-buffer))
+             (manifest-dir (locate-dominating-file src-file "Cargo.toml"))
+             (to-ret (rmsbolt--parse-cargo-compile-cmd
+                      manifest-dir (file-local-name src-file))))
+    (with-current-buffer src-buffer
+      (setq-local rmsbolt-default-directory (cl-first to-ret))
+      (setq-local rmsbolt-command (cl-second to-ret))
+      t)))
 ;;;; Language Definitions
 (defvar rmsbolt-languages)
 (setq

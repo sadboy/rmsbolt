@@ -247,6 +247,13 @@ which may cause Emacs to hang.
 3. Open the file in question, and enable ~rmsbolt-mode~.
 4. Run ~rmsbolt-compile~.
 
+
+** Rust
+
+Rust looks for a ~Cargo.toml~ file in any directory higher than the source
+file. When it finds one, it invokes ~cargo~ to get the ~rustc~ compilation
+command and working directory for the target that owns the current source file.
+
 * Developing
 
 These are some tips which will help people working on developing or customizing RMSbolt.

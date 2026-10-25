@@ -110,5 +110,104 @@
        (current-buffer))))))
 
 
+;;;; Cargo integration tests
+
+(ert-deftest cargo-extract-and-clean-cmd-test ()
+  (let* ((sample-output
+          (concat
+           "   Compiling foo v0.1.0 (/tmp/ws/crates/foo)\n"
+           "     Running `CARGO=/usr/bin/cargo CARGO_BIN_EXE_my-bin=/tmp/ws/target/debug/my-bin "
+           "CARGO_PKG_DESCRIPTION='A `quoted` description\nwith newline' "
+           "OUT_DIR=/tmp/ws/target/debug/build/foo-123/out "
+           "rustc --crate-name foo --edition=2024 src/lib.rs "
+           "--error-format=json --json=diagnostic-rendered-ansi,artifacts "
+           "--crate-type lib --emit=dep-info,metadata,link "
+           "-C embed-bitcode=no -C debuginfo=2 "
+           "--check-cfg 'cfg(feature, values(\"default\", \"loader\"))' "
+           "-C metadata=abc -C extra-filename=-def "
+           "--out-dir /tmp/ws/target/debug/deps "
+           "-C incremental=/tmp/ws/target/debug/incremental "
+           "-L dependency=/tmp/ws/target/debug/deps "
+           "--print crate-name -C lto=thin`\n"
+           "foo\n"))
+         (extracted (rmsbolt--extract-cargo-rustc-cmd sample-output))
+         (cleaned (rmsbolt--clean-cargo-rustc-cmd extracted)))
+    (should extracted)
+    (should (string-prefix-p "env CARGO=/usr/bin/cargo CARGO_BIN_EXE_my-bin=" cleaned))
+    (should (string-match-p "CARGO_PKG_DESCRIPTION='A `quoted` description\nwith newline'" cleaned))
+    (should (string-match-p "--check-cfg 'cfg(feature, values(\"default\", \"loader\"))'" cleaned))
+    (should (string-match-p "-C embed-bitcode=no" cleaned))
+    (should (string-match-p "-C metadata=abc" cleaned))
+    (should-not (string-match-p "--print" cleaned))
+    (should-not (string-match-p "--emit" cleaned))
+    (should-not (string-match-p "--out-dir" cleaned))
+    (should-not (string-match-p "--error-format" cleaned))
+    (should-not (string-match-p "--json" cleaned))
+    (should-not (string-match-p "extra-filename=" cleaned))
+    (should-not (string-match-p "incremental=" cleaned))
+    (should-not (string-match-p "debuginfo=" cleaned))
+    (should-not (string-match-p "lto" cleaned))))
+
+(ert-deftest cargo-find-target-test ()
+  (let* ((tmp-root (make-temp-file "rmsbolt-cargo-test-" t))
+         (src-dir (expand-file-name "src" tmp-root))
+         (tests-dir (expand-file-name "tests" tmp-root))
+         (manifest (expand-file-name "Cargo.toml" tmp-root))
+         (lib-rs (expand-file-name "lib.rs" src-dir))
+         (main-rs (expand-file-name "main.rs" src-dir))
+         (sub-rs (expand-file-name "asdl.rs" src-dir))
+         (cli-rs (expand-file-name "cli.rs" src-dir))
+         (test-rs (expand-file-name "mini_sql.rs" tests-dir))
+         (build-rs (expand-file-name "build.rs" tmp-root)))
+    (unwind-protect
+        (progn
+          (make-directory src-dir t)
+          (make-directory tests-dir t)
+          (with-temp-file manifest (insert "[package]\nname = \"demo\"\n"))
+          (with-temp-file lib-rs (insert "pub mod asdl;\n"))
+          (with-temp-file main-rs (insert "mod cli;\nfn main() {}\n"))
+          (with-temp-file sub-rs (insert "pub fn f() {}\n"))
+          (with-temp-file cli-rs (insert "pub fn g() {}\n"))
+          (with-temp-file test-rs (insert "#[test] fn t() {}\n"))
+          (with-temp-file build-rs (insert "#[path = \"src/asdl.rs\"]\nmod asdl;\nfn main() {}\n"))
+          (let ((metadata
+                 `((workspace_root . ,tmp-root)
+                   (packages
+                    . [((name . "demo")
+                        (manifest_path . ,manifest)
+                        (targets
+                         . [((name . "demo")
+                             (kind . ["lib"])
+                             (src_path . ,lib-rs))
+                            ((name . "demo-bin")
+                             (kind . ["bin"])
+                             (src_path . ,main-rs))
+                            ((name . "mini_sql")
+                             (kind . ["test"])
+                             (src_path . ,test-rs))
+                            ((name . "build-script-build")
+                             (kind . ["custom-build"])
+                             (src_path . ,build-rs))]))]))))
+            (should (equal (rmsbolt--cargo-target-args
+                            (cdr (rmsbolt--cargo-find-target metadata lib-rs)))
+                           '("--lib")))
+            (should (equal (rmsbolt--cargo-target-args
+                            (cdr (rmsbolt--cargo-find-target metadata sub-rs)))
+                           '("--lib")))
+            (should (equal (rmsbolt--cargo-target-args
+                            (cdr (rmsbolt--cargo-find-target metadata main-rs)))
+                           '("--bin" "demo-bin")))
+            (should (equal (rmsbolt--cargo-target-args
+                            (cdr (rmsbolt--cargo-find-target metadata cli-rs)))
+                           '("--bin" "demo-bin")))
+            (should (equal (rmsbolt--cargo-target-args
+                            (cdr (rmsbolt--cargo-find-target metadata test-rs)))
+                           '("--test" "mini_sql")))
+            (should (eq (rmsbolt--cargo-target-args
+                         (cdr (rmsbolt--cargo-find-target metadata build-rs)))
+                        'custom-build))))
+      (delete-directory tmp-root t))))
+
+
 ;;; rmsbolt-test.el ends here
 (provide 'rmsbolt-test)

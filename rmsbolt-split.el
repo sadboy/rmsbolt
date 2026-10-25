@@ -39,36 +39,54 @@
 
 (defvar rmsbolt-split--regexp (rx (1+ blank)))
 
+(defvar rmsbolt-split--token-regexp
+  (rx (1+ (or (seq "'" (0+ (not (any "'"))) "'")
+              (seq "\"" (0+ (or (seq "\\" anything)
+                                (not (any "\"\\"))))
+                   "\"")
+              (seq "\\" anything)
+              (not (any blank "\n" "'" "\"" "\\"))
+              "'" "\""))))
+
 ;;; Code:
+
+(defun rmsbolt-split--tokenize (cmd)
+  "Split CMD into shell tokens and keep quoted strings intact."
+  (let ((pos 0)
+        tokens)
+    (save-match-data
+      (while (string-match rmsbolt-split--token-regexp cmd pos)
+        (push (match-string 0 cmd) tokens)
+        (setq pos (match-end 0))))
+    (nreverse tokens)))
 
 (defun rmsbolt-split-rm-single (cmd flag &optional comparator)
   "Remove a single FLAG from CMD.
 
 Optionally compares using COMPARATOR."
-  (let ((cmd (split-string cmd rmsbolt-split--regexp))
+  (let ((cmd (rmsbolt-split--tokenize cmd))
         (comparator (or comparator #'string=)))
     (mapconcat
      #'identity
      (cl-remove-if (apply-partially comparator flag) cmd)
      " ")))
 
-(defun rmsbolt-split-rm-double (cmd flag)
-  "Remove a single FLAG and arg from CMD."
-  (let ((cmd (split-string cmd rmsbolt-split--regexp))
-        (removed nil))
-    (mapconcat
-     #'identity
-     (cl-remove-if (lambda (f)
-                     (cond
-                      ((string= f flag)
-                       (setq removed t))
-                      (removed
-                       (setq removed nil)
-                       t)
-                      (t nil)))
-                   cmd)
-     " ")))
+(defun rmsbolt-split-rm-double (cmd flag &optional arg comparator)
+  "Remove a single FLAG and its argument from CMD.
 
+If ARG is non-nil, remove FLAG and its argument only when the argument
+matches ARG with COMPARATOR."
+  (let ((cmd (rmsbolt-split--tokenize cmd))
+        (comparator (or comparator #'string=))
+        res)
+    (while cmd
+      (let ((f (pop cmd)))
+        (if (and (string= f flag)
+                 (or (not arg)
+                     (and cmd (funcall comparator arg (car cmd)))))
+            (pop cmd)
+          (push f res))))
+    (mapconcat #'identity (nreverse res) " ")))
 (provide 'rmsbolt-split)
 
 ;;; rmsbolt-split.el ends here
