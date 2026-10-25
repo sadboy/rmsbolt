@@ -982,50 +982,52 @@ return t if successful."
       t)))
 
 
+(defconst rmsbolt--cargo-target-kinds
+  '((("lib" "rlib" "dylib" "cdylib" "staticlib" "proc-macro") . "--lib")
+    (("bin") . "--bin")
+    (("test") . "--test")
+    (("example") . "--example")
+    (("bench") . "--bench")
+    (("custom-build") . nil))
+  "Cargo target kind groups, most to least preferred, with their `cargo rustc' flag.")
+
+(defun rmsbolt--cargo-target-kind-entry (kinds)
+  "Return `(INDEX . ENTRY)' in `rmsbolt--cargo-target-kinds' matching KINDS."
+  (cl-loop for entry in rmsbolt--cargo-target-kinds
+           for idx from 0
+           when (cl-some (lambda (k) (member k (car entry))) kinds)
+           return (cons idx entry)))
+
 (defun rmsbolt--cargo-target-kind-priority (kinds)
   "Return the selection priority for Cargo target KINDS."
-  (cond
-   ((cl-some (lambda (k)
-               (member k '("lib" "rlib" "dylib" "cdylib" "staticlib" "proc-macro")))
-             kinds)
-    6)
-   ((cl-find "bin" kinds :test #'string=) 5)
-   ((cl-find "test" kinds :test #'string=) 4)
-   ((cl-find "example" kinds :test #'string=) 3)
-   ((cl-find "bench" kinds :test #'string=) 2)
-   ((cl-find "custom-build" kinds :test #'string=) 1)
-   (t 0)))
+  (if-let* ((match (rmsbolt--cargo-target-kind-entry kinds)))
+      (- (length rmsbolt--cargo-target-kinds) (car match))
+    0))
+
+(defun rmsbolt--cargo-build-script-p (target)
+  "Return non-nil if TARGET is a Cargo `custom-build' target."
+  (when-let* ((match (rmsbolt--cargo-target-kind-entry (alist-get 'kind target))))
+    (null (cddr match))))
 
 (defun rmsbolt--cargo-target-args (target)
-  "Return `cargo rustc' target flags for TARGET, or `custom-build'."
-  (let ((kinds (alist-get 'kind target))
-        (name (alist-get 'name target))
-        (req-features (alist-get 'required-features target)))
-    (if (cl-find "custom-build" kinds :test #'string=)
-        'custom-build
-      (let ((base-args
-             (cond
-              ((cl-some (lambda (k)
-                          (member k '("lib" "rlib" "dylib" "cdylib" "staticlib" "proc-macro")))
-                        kinds)
-               '("--lib"))
-              ((cl-find "bin" kinds :test #'string=)
-               (list "--bin" name))
-              ((cl-find "test" kinds :test #'string=)
-               (list "--test" name))
-              ((cl-find "example" kinds :test #'string=)
-               (list "--example" name))
-              ((cl-find "bench" kinds :test #'string=)
-               (list "--bench" name)))))
-        (if (and base-args (> (length req-features) 0))
-            (append base-args (list "--features" (mapconcat #'identity req-features ",")))
-          base-args)))))
+  "Return `cargo rustc' target flags for TARGET, or nil for a build script."
+  (when-let* ((match (rmsbolt--cargo-target-kind-entry (alist-get 'kind target)))
+              (flag (cddr match)))
+    (let* ((name (alist-get 'name target))
+           (req-features (alist-get 'required-features target))
+           (base-args (if (string= flag "--lib")
+                          (list flag)
+                        (list flag name))))
+      (if (> (length req-features) 0)
+          (append base-args (list "--features" (mapconcat #'identity req-features ",")))
+        base-args))))
 
 (defun rmsbolt--cargo-score-less-p (a b)
   "Return non-nil if score list A is lexicographically less than B."
+  (cl-assert (= (length a) (length b)))
   (cl-loop for x in a
            for y in b
-           when (/= x y)
+           unless (eql x y)
            return (< x y)))
 
 (defun rmsbolt--cargo-sanitize-rust-source (source)
@@ -1331,23 +1333,24 @@ nil to match the last `rustc' invocation."
                        (pkg (car-safe match))
                        (target (cdr-safe match))
                        (pkg-name (alist-get 'name pkg))
+                       (build-script-p (and target (rmsbolt--cargo-build-script-p target)))
                        (target-args (and target (rmsbolt--cargo-target-args target))))
                   (when workspace-dir
                     (rmsbolt--cargo-cache-put manifest-dir manifest-dir workspace-dir metadata))
-                  (if (not (and workspace-dir pkg-name target-args))
+                  (if (not (and workspace-dir pkg-name (or build-script-p target-args)))
                       (setq err-msg (format "no target found for %s" file))
-                    (let ((target-key (list workspace-dir pkg-name target-args)))
+                    (let ((target-key (list workspace-dir pkg-name
+                                            (if build-script-p 'custom-build target-args))))
                       (if-let* ((cached-target (rmsbolt--cargo-cache-get target-key manifest-dir)))
                           (setq result (rmsbolt--cargo-cache-put
                                         file-key manifest-dir workspace-dir cached-target))
                         (let* ((default-directory workspace-dir)
-                               (build-script-p (eq target-args 'custom-build))
                                (cargo-args
                                 (if build-script-p
                                     (let ((other-args
                                            (cl-loop for tgt across (alist-get 'targets pkg)
                                                     for args = (rmsbolt--cargo-target-args tgt)
-                                                    when (and args (not (eq args 'custom-build)))
+                                                    when args
                                                     return args)))
                                       (if other-args
                                           (append (list "rustc" "-p" pkg-name)

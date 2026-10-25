@@ -203,9 +203,10 @@
             (should (equal (rmsbolt--cargo-target-args
                             (cdr (rmsbolt--cargo-find-target metadata test-rs)))
                            '("--test" "mini_sql")))
-            (should (eq (rmsbolt--cargo-target-args
-                         (cdr (rmsbolt--cargo-find-target metadata build-rs)))
-                        'custom-build))))
+            (should (rmsbolt--cargo-build-script-p
+                     (cdr (rmsbolt--cargo-find-target metadata build-rs))))
+            (should-not (rmsbolt--cargo-target-args
+                         (cdr (rmsbolt--cargo-find-target metadata build-rs))))))
       (delete-directory tmp-root t))))
 
 
