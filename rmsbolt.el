@@ -1190,68 +1190,107 @@ Lifted from https://emacs.stackexchange.com/questions/35936/disassembly-of-a-byt
 ;; Filtering functions were more or less lifted from the godbolt compiler explorer to maintain compatiblity.
 ;; https://github.com/mattgodbolt/compiler-explorer/blob/master/lib/asm.js
 
-(defun rmsbolt--has-opcode-p (line)
-  "Check if LINE has opcodes."
-  (save-match-data
-    (let* ((match (string-match rmsbolt-label-def line))
-           (line (if match
-                     (substring line (match-end 0))
-                   line))
-           (line (cl-first (split-string line (rx (1+ (any ";#")))))))
-      (if (string-match-p rmsbolt-assignment-def line)
-          nil
-        (string-match-p rmsbolt-has-opcode line)))))
+(defmacro rmsbolt--sweeping (src-buffer &rest forms)
+  "Sweep the current buffer for SRC-BUFFER and evaluate FORMS on each line."
+  (declare (indent 1)
+           (debug (form &rest (form &rest form))))
+  (let ((lbp (gensym "lbp-"))
+        (lep (gensym "lep-"))
+        (preserve-directives (gensym "preserve-directives-"))
+        (linum (gensym "linum-"))
+        (ht (gensym "ht-"))
+        (prev-property (gensym "prev-property-"))
+        (property (gensym "property-"))
+        (regions (gensym "regions-")))
+    `(let ((,preserve-directives
+            (not (buffer-local-value 'rmsbolt-filter-directives ,src-buffer)))
+           (,linum 1)
+           (,ht (make-hash-table :test #'eq))
+           (,prev-property nil))
+       (goto-char (point-min))
+       (while (not (eobp))
+         (let ((,lbp (line-beginning-position))
+               (,lep (line-end-position)))
+           (cl-macrolet ((match (&rest res)
+                           `(cl-loop for re in ,(cons 'list res)
+                                     thereis (re-search-forward re ,',lep t)))
+                         (asm-linum () ',linum)
+                         (kill-line ()
+                           `(delete-region ,',lbp (min (point-max) (1+ ,',lep))))
+                         (preserve ()
+                           `(let ((,',property (get-text-property ,',lbp 'rmsbolt-src-line)))
+                              (when ,',property
+                                (let ((,',regions (gethash ,',property ,',ht)))
+                                  (if (and (eq ,',property ,',prev-property)
+                                           ,',regions
+                                           (= ,',linum (1+ (cdar ,',regions))))
+                                      (setcdr (car ,',regions) ,',linum)
+                                    (puthash ,',property
+                                             (cons (cons ,',linum ,',linum) ,',regions)
+                                             ,',ht))))
+                              (setq ,',prev-property ,',property
+                                    ,',linum (1+ ,',linum))
+                              (forward-line 1))))
+             (pcase (cond ,@forms)
+               (:preserve (preserve))
+               (:kill (kill-line))
+               (_
+                (if ,preserve-directives (preserve)
+                  (kill-line)))))))
+       (with-current-buffer ,src-buffer
+         (setq rmsbolt-line-mapping ,ht)))))
 
-(defun rmsbolt--find-used-labels (src-buffer asm-lines)
-  "Find used labels in ASM-LINES generated from SRC-BUFFER."
-  (let ((match nil)
-        (current-label nil)
-        (labels-used (make-hash-table :test #'equal))
-        (weak-usages (make-hash-table :test #'equal)))
-    (dolist (line asm-lines)
-      (setq line (string-trim-left line)
-            match (and (string-match rmsbolt-label-def line)
-                       (match-string 1 line)))
-      (when match
-        (setq current-label match))
-      (setq match (and (string-match rmsbolt-defines-global line)
-                       (match-string 1 line)))
-      (when match
-        (puthash match t labels-used))
-      ;; When we have no line or a period started line, skip
-      (unless (or (string-empty-p line)
-                  (eq (elt line 0) ?.)
-                  (not (string-match-p rmsbolt-label-find line)))
-        (if (or (not (buffer-local-value 'rmsbolt-filter-directives src-buffer))
-                (rmsbolt--has-opcode-p line)
-                (string-match-p rmsbolt-defines-function line))
-            ;; Add labels indescriminantly
-            (dolist (l (rmsbolt-re-seq rmsbolt-label-find line))
-              (puthash l t labels-used))
-          (when (and current-label
-                     (or (string-match-p rmsbolt-data-defn line)
-                         (rmsbolt--has-opcode-p line)))
-            (dolist (l (rmsbolt-re-seq rmsbolt-label-find line))
-              (cl-pushnew l (gethash current-label weak-usages) :test #'equal))))))
+(defun rmsbolt--has-opcode-p (&optional line)
+  "Return non-nil if the current line or LINE has opcodes."
+  (save-excursion
+    (save-match-data
+      (if line
+          (let* ((match (string-match rmsbolt-label-def line))
+                 (line (if match
+                           (substring line (match-end 0))
+                         line))
+                 (line (cl-first (split-string line (rx (1+ (any ";#")))))))
+            (if (string-match-p rmsbolt-assignment-def line)
+                nil
+              (string-match-p rmsbolt-has-opcode line)))
+        (let ((lbp (line-beginning-position))
+              (lep (line-end-position)))
+          (goto-char lbp)
+          (when (looking-at rmsbolt-label-def)
+            (goto-char (match-end 0)))
+          (let ((end (save-excursion
+                       (skip-chars-forward "^;#\n" lep)
+                       (point))))
+            (skip-chars-forward " \t" end)
+            (let ((c (char-after)))
+              (and (< (point) end)
+                   (or (<= ?a c ?z) (<= ?A c ?Z))
+                   (not (looking-at-p "[a-zA-Z0-9$_.]+[ \t]*="))))))))))
 
-    (let* ((max-label-iter 10)
-           (label-iter 0)
-           (completed nil))
-
-      (while (and (<= (cl-incf label-iter)
-                      max-label-iter)
-                  (not completed))
-        (let ((to-add nil))
-          (maphash
-           (lambda (label _v)
-             (dolist (now-used (gethash label weak-usages))
-               (when (not (gethash now-used labels-used))
-                 (cl-pushnew now-used to-add :test #'equal))))
-           labels-used)
-          (if to-add
-              (dolist (l to-add)
-                (puthash l t labels-used))
-            (setq completed t))))
+(defun rmsbolt--find-used-labels (src-buffer &optional asm-lines)
+  "Find used labels in the current buffer or ASM-LINES from SRC-BUFFER."
+  (if asm-lines
+      (with-temp-buffer
+        (insert (string-join asm-lines "\n"))
+        (rmsbolt--find-used-labels src-buffer))
+    (let ((labels-used (make-hash-table :test #'equal))
+          (filter-directives (buffer-local-value 'rmsbolt-filter-directives src-buffer)))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (let ((lbp (line-beginning-position))
+                (lep (line-end-position)))
+            (skip-chars-forward " \t" lep)
+            (when (< (point) lep)
+              (if (eq (char-after) ?.)
+                  (when (progn (goto-char lbp)
+                               (looking-at rmsbolt-defines-global))
+                    (puthash (match-string-no-properties 1) t labels-used))
+                (when (or (not filter-directives)
+                          (rmsbolt--has-opcode-p))
+                  (while (re-search-forward rmsbolt-label-find lep t)
+                    (puthash (match-string-no-properties 0) t labels-used))))))
+          (forward-line 1)))
       labels-used)))
 
 (defun rmsbolt--user-func-p (src-buffer func)
@@ -1264,133 +1303,140 @@ Argument SRC-BUFFER source buffer."
         (not (string-match-p regexp func))
       t)))
 
-;; TODO godbolt does not handle disassembly with filter=off, but we should.
-(cl-defun rmsbolt--process-disassembled-lines (src-buffer asm-lines)
-  "Process and filter disassembled ASM-LINES from SRC-BUFFER."
-  (let* ((src-file-name (or (buffer-local-value 'rmsbolt--real-src-file src-buffer)
-                            (buffer-file-name src-buffer)))
-         (local-src-file-name (file-local-name src-file-name))
-         (result nil)
-         (func nil)
-         (source-linum nil)
-         (def-dir (or (buffer-local-value 'rmsbolt-default-directory src-buffer)
-                      (and src-file-name
-                           (file-name-directory src-file-name)))))
-    (dolist (line asm-lines)
-      (catch 'continue
-        (when (and (> (length result) rmsbolt-binary-asm-limit)
-                   (not (buffer-local-value 'rmsbolt-ignore-binary-limit src-buffer)))
-          (cl-return-from rmsbolt--process-disassembled-lines
-            '("Aborting processing due to exceeding the binary limit.")))
-        (when (string-match rmsbolt-disass-line line)
-          ;; Don't add linums from files which we aren't inspecting
-          ;; If we get a non-absolute .file path, check to see if we
-          ;; have a default dir. If not, treat it like we are in the
-          ;; src directory.
-          (let ((default-directory def-dir))
-            (if (rmsbolt--file-equal-p local-src-file-name
-                              (match-string 1 line))
-                (setq source-linum (string-to-number (match-string 2 line)))
-              (setq source-linum nil)))
-          ;; We are just setting a linum, no data here.
-          (throw 'continue t))
+(cl-defun rmsbolt--process-disassembled-lines (src-buffer &optional asm-lines)
+  "Filter disassembled lines in current buffer or ASM-LINES from SRC-BUFFER."
+  (if asm-lines
+      (with-temp-buffer
+        (insert (string-join asm-lines "\n"))
+        (rmsbolt--process-disassembled-lines src-buffer)
+        (split-string (buffer-string) "\n" t))
+    (let* ((src-file-name (or (buffer-local-value 'rmsbolt--real-src-file src-buffer)
+                              (buffer-file-name src-buffer)))
+           (local-src-file-name (and src-file-name (file-local-name src-file-name)))
+           (func nil)
+           (user-func-p nil)
+           (source-linum nil)
+           (ignore-limit (buffer-local-value 'rmsbolt-ignore-binary-limit src-buffer))
+           (def-dir (or (buffer-local-value 'rmsbolt-default-directory src-buffer)
+                        (and src-file-name
+                             (file-name-directory src-file-name)))))
+      (rmsbolt--sweeping src-buffer
+        ((and (not ignore-limit)
+              (> (asm-linum) rmsbolt-binary-asm-limit))
+         (erase-buffer)
+         (insert "Aborting processing due to exceeding the binary limit.")
+         (cl-return-from rmsbolt--process-disassembled-lines
+           '("Aborting processing due to exceeding the binary limit.")))
+        ((looking-at rmsbolt-disass-line)
+         (let ((default-directory def-dir))
+           (if (rmsbolt--file-equal-p local-src-file-name
+                                      (match-string-no-properties 1))
+               (setq source-linum (string-to-number (match-string-no-properties 2)))
+             (setq source-linum nil)))
+         :kill)
+        ((looking-at rmsbolt-disass-label)
+         (setq func (match-string-no-properties 2)
+               user-func-p (rmsbolt--user-func-p src-buffer func))
+         (if user-func-p
+             (progn
+               (replace-match (concat func ":") t t)
+               :preserve)
+           :kill))
+        ((not (and func user-func-p))
+         :kill)
+        ((looking-at rmsbolt-disass-opcode)
+         (replace-match (concat (match-string-no-properties 1)
+                                "\t" (match-string-no-properties 3))
+                        t t)
+         (when source-linum
+           (put-text-property (line-beginning-position) (line-end-position)
+                              'rmsbolt-src-line source-linum))
+         :preserve)
+        (t :kill)))))
 
-        (when (string-match rmsbolt-disass-label line)
-          (setq func (match-string 2 line))
-          (when (rmsbolt--user-func-p src-buffer func)
-            (push (concat func ":") result))
-          (throw 'continue t))
-        (unless (and func
-                     (rmsbolt--user-func-p src-buffer func))
-          (throw 'continue t))
-        (when (string-match rmsbolt-disass-opcode line)
-          (let ((line (concat (match-string 1 line)
-                              "\t" (match-string 3 line))))
-            ;; Add line text property if available
-            (when source-linum
-              (add-text-properties 0 (length line)
-                                   `(rmsbolt-src-line ,source-linum) line))
-            (push line result))
-          (throw 'continue t))))
-    (nreverse result)))
-
-(cl-defun rmsbolt--process-src-asm-lines (src-buffer asm-lines)
-  "Process and filter compiler-generated ASM-LINES from SRC-BUFFER."
-  (let* ((used-labels (rmsbolt--find-used-labels src-buffer asm-lines))
-         (src-file-name (or (buffer-local-value 'rmsbolt--real-src-file src-buffer)
-                            (buffer-file-name src-buffer)))
-         (local-src-file-name (file-local-name src-file-name))
-         (result nil)
-         (prev-label nil)
-         (source-linum nil)
-         (source-file-map (make-hash-table :test #'eq))
-         (def-dir (or (buffer-local-value 'rmsbolt-default-directory src-buffer)
-                      (and src-file-name
-                           (file-name-directory src-file-name)))))
-    (dolist (line asm-lines)
-      (let* ((raw-match (or (string-match rmsbolt-label-def line)
-                            (string-match rmsbolt-assignment-def line)))
-             (match (when raw-match
-                      (match-string 1 line)))
-             (used-label-p (gethash match used-labels)))
-        (catch 'continue
-          (cond
-           ((string-match rmsbolt-source-file line)
-            (let* ((file (if (match-string 3 line)
-                             (expand-file-name (match-string 3 line) (match-string 2 line))
-                           (match-string 2 line)))
-                   (match-p (or (not src-file-name)
-                                (let ((default-directory def-dir))
-                                  (rmsbolt--file-equal-p local-src-file-name file)))))
-              (puthash (string-to-number (match-string 1 line))
-                       match-p
-                       source-file-map)))
-           ((string-match rmsbolt-source-tag line)
-            (if (or (not src-file-name)
-                    (gethash (string-to-number (match-string 1 line))
-                             source-file-map))
-                (setq source-linum (string-to-number
-                                    (match-string 2 line)))
-              (setq source-linum nil)))
-           ((string-match rmsbolt-source-stab line)
-            (pcase (string-to-number (match-string 1 line))
-              ;; http://www.math.utah.edu/docs/info/stabs_11.html
-              (68
-               (setq source-linum (match-string 2 line)))
-              ((or 100 132)
-               (setq source-linum nil)))))
-          ;; End block, reset prev-label and source
-          (when (string-match-p rmsbolt-endblock line)
-            (setq prev-label nil))
-
-          (when (and (buffer-local-value 'rmsbolt-filter-comment-only src-buffer)
-                     (string-match-p rmsbolt-comment-only line))
-            (throw 'continue t))
-
-          ;; continue means we don't add to the ouptut
-          (when match
-            (if (not used-label-p)
-                ;; Unused label
-                (when (buffer-local-value 'rmsbolt-filter-labels src-buffer)
-                  (throw 'continue t))
-              ;; Real label, set prev-label
-              (setq prev-label raw-match)))
-          (when (and (buffer-local-value 'rmsbolt-filter-directives src-buffer)
-                     (not match))
-            (if  (and (string-match-p rmsbolt-data-defn line)
-                      prev-label)
-                ;; data is being used
-                nil
-              (when (string-match-p rmsbolt-directive line)
-                (throw 'continue t))))
-          ;; Add line numbers to mapping
-          (when (and source-linum
-                     (rmsbolt--has-opcode-p line))
-            (add-text-properties 0 (length line)
-                                 `(rmsbolt-src-line ,source-linum) line))
-          ;; Add line
-          (push line result))))
-    (nreverse result)))
+(cl-defun rmsbolt--process-src-asm-lines (src-buffer &optional asm-lines)
+  "Process and filter assembly in the current buffer or ASM-LINES from SRC-BUFFER."
+  (if asm-lines
+      (with-temp-buffer
+        (insert (string-join asm-lines "\n"))
+        (rmsbolt--process-src-asm-lines src-buffer)
+        (split-string (buffer-string) "\n" t))
+    (let* ((used-labels (rmsbolt--find-used-labels src-buffer))
+           (src-file-name (or (buffer-local-value 'rmsbolt--real-src-file src-buffer)
+                              (buffer-file-name src-buffer)))
+           (local-src-file-name (and src-file-name (file-local-name src-file-name)))
+           (prev-label nil)
+           (source-linum nil)
+           (source-file-map (make-hash-table :test #'eq))
+           (def-dir (or (buffer-local-value 'rmsbolt-default-directory src-buffer)
+                        (and src-file-name
+                             (file-name-directory src-file-name))))
+           (filter-comment-only (buffer-local-value 'rmsbolt-filter-comment-only src-buffer))
+           (filter-labels (buffer-local-value 'rmsbolt-filter-labels src-buffer))
+           (filter-directives (buffer-local-value 'rmsbolt-filter-directives src-buffer)))
+      (rmsbolt--sweeping src-buffer
+        (t
+         (let* ((lbp (line-beginning-position))
+                (lep (line-end-position))
+                (raw-match (or (looking-at rmsbolt-label-def)
+                               (looking-at rmsbolt-assignment-def)))
+                (match (when raw-match
+                         (match-string-no-properties 1)))
+                (used-label-p (and match (gethash match used-labels))))
+           (skip-chars-forward " \t" lep)
+           (let ((first-char (char-after)))
+             (when (eq first-char ?.)
+               (goto-char lbp)
+               (cond
+                ((looking-at rmsbolt-source-file)
+                 (let* ((file (if (match-string 3)
+                                  (expand-file-name (match-string-no-properties 3)
+                                                    (match-string-no-properties 2))
+                                (match-string-no-properties 2)))
+                        (match-p (or (not src-file-name)
+                                     (let ((default-directory def-dir))
+                                       (rmsbolt--file-equal-p local-src-file-name file)))))
+                   (puthash (string-to-number (match-string-no-properties 1))
+                            match-p
+                            source-file-map)))
+                ((looking-at rmsbolt-source-tag)
+                 (if (or (not src-file-name)
+                         (gethash (string-to-number (match-string-no-properties 1))
+                                  source-file-map))
+                     (setq source-linum (string-to-number
+                                         (match-string-no-properties 2)))
+                   (setq source-linum nil)))
+                ((match rmsbolt-source-stab)
+                 (pcase (string-to-number (match-string-no-properties 1))
+                   (68
+                    (setq source-linum (string-to-number (match-string-no-properties 2))))
+                   ((or 100 132)
+                    (setq source-linum nil)))))
+               (goto-char lbp)
+               (when (match rmsbolt-endblock)
+                 (setq prev-label nil)))
+             (goto-char lbp)
+             (cond
+              ((and filter-comment-only
+                    (not (eq first-char ?.))
+                    (looking-at-p rmsbolt-comment-only))
+               :kill)
+              ((and match (not used-label-p) filter-labels)
+               :kill)
+              (t
+               (when (and match used-label-p)
+                 (setq prev-label raw-match))
+               (if (and filter-directives
+                        (not match)
+                        (eq first-char ?.)
+                        (not (and prev-label
+                                  (looking-at-p rmsbolt-data-defn))))
+                   :kill
+                 (when (and source-linum
+                            (not (and (not match) (eq first-char ?.)))
+                            (rmsbolt--has-opcode-p))
+                   (put-text-property lbp lep 'rmsbolt-src-line source-linum))
+                 :preserve))))))))))
 
 (cl-defun rmsbolt--process-php-bytecode (src-buffer asm-lines)
   "Process and filter php ASM-LINES from SRC-BUFFER."
@@ -1464,22 +1510,41 @@ Argument ASM-LINES input lines."
    asm-lines
    (buffer-local-value 'rmsbolt-filter-directives src-buffer)))
 
-(cl-defun rmsbolt--process-asm-lines (src-buffer asm-lines)
-  "Process and filter a set of ASM-LINES from SRC-BUFFER.
-
-Essentially a switch that chooses which processing function to use."
+(cl-defun rmsbolt--process-asm-lines (src-buffer &optional asm-lines)
+  "Process and filter assembly in the current buffer or ASM-LINES from SRC-BUFFER."
   (let* ((lang (with-current-buffer src-buffer
                  (rmsbolt--get-lang)))
          (process-asm-fn (when lang
                            (rmsbolt-l-process-asm-custom-fn lang))))
     (cond
      (process-asm-fn
-      (funcall process-asm-fn src-buffer asm-lines))
+      (if asm-lines
+          (funcall process-asm-fn src-buffer asm-lines)
+        (let ((lines (funcall process-asm-fn
+                              src-buffer
+                              (split-string (buffer-string) "\n" nil)))
+              (ht (make-hash-table :test #'eq))
+              (linum 1)
+              (prev-property nil))
+          (dolist (line lines)
+            (let ((property (get-text-property 0 'rmsbolt-src-line line)))
+              (when property
+                (let ((regions (gethash property ht)))
+                  (if (and (eq property prev-property)
+                           regions
+                           (= linum (1+ (cdar regions))))
+                      (setcdr (car regions) linum)
+                    (puthash property (cons (cons linum linum) regions) ht))))
+              (setq prev-property property
+                    linum (1+ linum))))
+          (with-current-buffer src-buffer
+            (setq rmsbolt-line-mapping ht))
+          (erase-buffer)
+          (insert (string-join lines "\n")))))
      ((buffer-local-value 'rmsbolt-disassemble src-buffer)
       (rmsbolt--process-disassembled-lines src-buffer asm-lines))
      (t
       (rmsbolt--process-src-asm-lines src-buffer asm-lines)))))
-
 (cl-defun rmsbolt--process-go-asm-lines (_src-buffer asm-lines)
   "Process and filter go ASM-LINES from SRC-BUFFER."
   (let ((source-linum nil)
@@ -1586,58 +1651,26 @@ Argument STOPPED The compilation was stopped to start another compilation."
              (if (and (not override-buffer)
                       (not (file-exists-p (rmsbolt-output-filename src-buffer t))))
                  (message "Error reading from output file.")
-               (let ((lines
-                      (rmsbolt--process-asm-lines
-                       src-buffer
-                       (or (when override-buffer
-                             (with-current-buffer override-buffer
-                               (split-string (buffer-string) "\n" nil)))
-                           (with-temp-buffer
-                             (insert-file-contents (rmsbolt-output-filename src-buffer t))
-                             (split-string (buffer-string) "\n" nil)))))
-                     (ht (make-hash-table :test #'eq))
-                     (linum 1)
-                     (start-match nil)
-                     (in-match nil)
-                     (output-buffer (current-buffer)))
-                 ;; Add lines to hashtable
-                 (dolist (line lines)
-                   (let ((property
-                          (get-text-property
-                           0 'rmsbolt-src-line line)))
-                     (cl-tagbody
-                      run-conditional
-                      (cond
-                       ((and in-match (eq in-match property))
-                        ;; We are continuing an existing match
-                        nil)
-                       (in-match
-                        ;; We are in a match that has just expired
-                        (push (cons start-match (1- linum))
-                              (gethash in-match ht))
-                        (setq in-match nil
-                              start-match nil)
-                        (go run-conditional))
-                       (property
-                        (setq in-match property
-                              start-match linum)))))
-                   (cl-incf linum))
-
-                 (with-current-buffer src-buffer
-                   (setq rmsbolt-line-mapping ht))
-
-                 ;; Replace buffer contents but save point and scroll
-                 (let* ((window (get-buffer-window output-buffer))
-                        (old-point (window-point window))
-                        (old-window-start (window-start window)))
-                   (erase-buffer)
-                   (insert (string-join lines "\n"))
-                   (when window
-                     (set-window-start window old-window-start)
-                     (set-window-point window old-point)))
+               (let* ((output-buffer (current-buffer))
+                      (window (get-buffer-window output-buffer))
+                      (old-point (and window (window-point window)))
+                      (old-window-start (and window (window-start window))))
                  (asm-mode)
                  (rmsbolt-mode 1)
-                 (setq rmsbolt-src-buffer src-buffer)
+                 (buffer-disable-undo)
+                 (setq default-directory src-default-directory
+                       rmsbolt-src-buffer src-buffer)
+                 (let ((inhibit-modification-hooks t)
+                       (inhibit-read-only t))
+                   (erase-buffer)
+                   (if override-buffer
+                       (insert-buffer-substring override-buffer)
+                     (insert-file-contents (rmsbolt-output-filename src-buffer t)))
+                   (save-excursion
+                     (rmsbolt--process-asm-lines src-buffer)))
+                 (when window
+                   (set-window-start window old-window-start)
+                   (set-window-point window old-point))
                  (display-buffer (current-buffer) '(nil (inhibit-same-window . t)))
                  (run-at-time 0 nil #'rmsbolt-update-overlays))))
             (t ; Compilation failed
