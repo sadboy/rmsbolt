@@ -2447,7 +2447,8 @@ Uses LANG-NAME to determine the language."
   "Return the assembly chunks mapped to SRC-LINE in SRC-BUFFER.
 The chunks are ordered by their start line.  Each chunk is a cons of its
 first and last line number in the rmsbolt output buffer."
-  (let ((mapping (buffer-local-value 'rmsbolt-line-mapping src-buffer)))
+  (let ((mapping (and (buffer-live-p src-buffer)
+                      (buffer-local-value 'rmsbolt-line-mapping src-buffer))))
     (when mapping
       (sort (copy-sequence (gethash src-line mapping))
             (lambda (a b) (< (car a) (car b)))))))
@@ -2459,13 +2460,14 @@ first and last line number in the rmsbolt output buffer."
 (defun rmsbolt--output-focus-line (output-buffer)
   "Return the line in OUTPUT-BUFFER that currently has focus."
   (with-current-buffer output-buffer
-    (line-number-at-pos (if-let* ((window (get-buffer-window output-buffer)))
-                            (window-point window)
-                          (point)))))
+    (line-number-at-pos
+     (if-let* ((window (get-buffer-window output-buffer 'visible)))
+         (window-point window)
+       (point)))))
 
 (defun rmsbolt--output-focus-chunk (chunk output-buffer)
   "Move the focus in OUTPUT-BUFFER to the start of CHUNK."
-  (if-let* ((window (get-buffer-window output-buffer)))
+  (if-let* ((window (get-buffer-window output-buffer 'visible)))
       (with-selected-window window
         (goto-char (point-min))
         (forward-line (1- (car chunk)))
@@ -2488,9 +2490,13 @@ at either end."
                          src-buffer
                          (eq (current-buffer) src-buffer))))
     (unless (or in-output in-source)
-      (user-error "Not in an rmsbolt source or output buffer"))
+      (user-error "This buffer is not linked to the rmsbolt output buffer"))
+    (unless (buffer-live-p src-buffer)
+      (user-error "The rmsbolt output buffer has no live source buffer"))
     (let* ((src-line (if in-output
-                         (get-text-property (point) 'rmsbolt-src-line)
+                         (or (get-text-property (point) 'rmsbolt-src-line)
+                             (get-text-property (line-beginning-position)
+                                                'rmsbolt-src-line))
                        (line-number-at-pos)))
            (chunks (and src-line (rmsbolt--output-chunks src-buffer src-line))))
       (unless chunks
@@ -2499,7 +2505,9 @@ at either end."
         (if (= count 1)
             (message "Source line %d maps to a single assembly chunk" src-line)
           (let* ((current (rmsbolt--output-chunk-at-line
-                           (rmsbolt--output-focus-line output-buffer)
+                           (if in-output
+                               (line-number-at-pos)
+                             (rmsbolt--output-focus-line output-buffer))
                            chunks))
                  (index (if current
                             (cl-position current chunks :test #'eq)

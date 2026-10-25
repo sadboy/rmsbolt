@@ -218,6 +218,53 @@ stored out of order to exercise sorting."
               #'rmsbolt-output-forward-chunk))
   (should (eq (lookup-key rmsbolt-mode-map (kbd "C-c C-p"))
               #'rmsbolt-output-backward-chunk)))
+
+(ert-deftest output-chunk-end-of-line-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-current-buffer rmsbolt-output-buffer
+      (goto-char (point-min))
+      (goto-char (line-end-position))
+      (rmsbolt-output-forward-chunk)
+      (should (= (line-number-at-pos) 6)))))
+
+(ert-deftest output-chunk-no-live-source-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (should-not (rmsbolt--output-chunks nil 5))
+    (with-current-buffer rmsbolt-output-buffer
+      (setq rmsbolt-src-buffer nil)
+      (goto-char (point-min))
+      (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
+      (should-error (rmsbolt-output-backward-chunk) :type 'user-error))
+    (let ((dead-src (generate-new-buffer " *rmsbolt-test-dead-src*")))
+      (with-current-buffer rmsbolt-output-buffer
+        (setq rmsbolt-src-buffer dead-src))
+      (kill-buffer dead-src)
+      (should-not (rmsbolt--output-chunks dead-src 5))
+      (with-current-buffer rmsbolt-output-buffer
+        (goto-char (point-min))
+        (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
+        (should-error (rmsbolt-output-backward-chunk) :type 'user-error)))))
+
+(ert-deftest output-chunk-displayed-output-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (save-window-excursion
+      (display-buffer rmsbolt-output-buffer '(nil (inhibit-same-window . t)))
+      (let ((output-window (get-buffer-window rmsbolt-output-buffer 'visible)))
+        (should output-window)
+        (with-current-buffer src-buffer
+          (goto-char (point-min))
+          (forward-line 4)
+          (set-window-point output-window (point-min))
+          (set-window-start output-window (point-min))
+          (rmsbolt-output-forward-chunk)
+          (should (= (with-current-buffer rmsbolt-output-buffer
+                       (line-number-at-pos (window-point output-window)))
+                     6))
+          (rmsbolt-output-forward-chunk)
+          (should (= (with-current-buffer rmsbolt-output-buffer
+                       (line-number-at-pos (window-point output-window)))
+                     1)))))))
+
 (ert-deftest output-chunk-unmapped-position-test ()
   (rmsbolt-test--with-chunk-buffers
     (with-current-buffer rmsbolt-output-buffer
