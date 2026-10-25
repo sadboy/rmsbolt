@@ -622,26 +622,27 @@ Use SRC-BUFFER as buffer containing local variables."
 Use SRC-BUFFER as buffer for local variables."
   (rmsbolt--with-local-files
    src-buffer
-   (let* ((no-src-filename (rmsbolt--handle-rust-compile-cmd src-buffer))
+   (let* ((omit-src-filename (rmsbolt--handle-rust-compile-cmd src-buffer))
           (asm-format (buffer-local-value 'rmsbolt-asm-format src-buffer))
           (disass (buffer-local-value 'rmsbolt-disassemble src-buffer))
           (cmd (buffer-local-value 'rmsbolt-command src-buffer))
           (cmd (string-join
-                (list cmd
-                      "-C" "debuginfo=1"
-                      "--emit"
-                      (if disass
-                          "link"
-                        "asm")
-                      (if no-src-filename
-                          ""
-                        src-filename)
-                      "-o" output-filename
-                      (when (and (not (booleanp asm-format))
-                                 (not disass))
-                        (concat "-Cllvm-args=--x86-asm-syntax=" asm-format)))
+                (delq nil
+                      (list cmd
+                            "-C" "debuginfo=1"
+                            "--emit"
+                            (if disass
+                                "link"
+                              "asm")
+                            (unless omit-src-filename
+                              src-filename)
+                            "-o" output-filename
+                            (when (and (not (booleanp asm-format))
+                                       (not disass))
+                              (concat "-Cllvm-args=--x86-asm-syntax=" asm-format))))
                 " ")))
      cmd)))
+
 (cl-defun rmsbolt--go-compile-cmd (&key src-buffer)
   "Process a compile command for go.
 
@@ -981,7 +982,6 @@ return t if successful."
                                 (rmsbolt-split-rm-double "-o")))
       t)))
 
-
 (defconst rmsbolt--cargo-target-kinds
   '((("lib" "rlib" "dylib" "cdylib" "staticlib" "proc-macro") . "--lib")
     (("bin") . "--bin")
@@ -1218,7 +1218,9 @@ nil to match the last `rustc' invocation."
             (buffer-substring-no-properties (match-end 0) cmd-end)))))))
 
 (defun rmsbolt--clean-cargo-rustc-cmd (cmd)
-  "Remove Cargo flags from CMD that conflict with RMSBolt output."
+  "Remove Cargo flags from CMD that conflict with RMSBolt output.
+Flags such as `-C strip=...' are kept because linker stripping does not
+remove `.loc' directives from `--emit asm' output."
   (let ((cleaned
          (thread-first cmd
                        (rmsbolt-split-rm-double "--print")
@@ -1417,6 +1419,7 @@ Return t if successful."
       (setq-local rmsbolt-default-directory (cl-first to-ret))
       (setq-local rmsbolt-command (cl-second to-ret))
       t)))
+
 ;;;; Language Definitions
 (defvar rmsbolt-languages)
 (setq
