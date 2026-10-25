@@ -956,21 +956,50 @@ Depends on the active toolchain."
                       (string-join (alist-get 'arguments entry) " "))))
     (list dir cmd)))
 
+(defun rmsbolt--parse-compile-flags (comp-flags file &optional cmd)
+  "Parse COMP-FLAGS and build a compilation dir and command for FILE with CMD."
+  (when (file-readable-p comp-flags)
+    (let* ((dir (file-name-directory comp-flags))
+           (flags (with-temp-buffer
+                    (insert-file-contents comp-flags)
+                    (split-string (buffer-string) "\n" t "[ \t\r]+")))
+           (file-arg (rmsbolt--convert-file-name-to-system-type
+                      (shell-quote-argument file))))
+      (list dir
+            (string-join
+             (delq nil (append (list cmd) flags (list file-arg)))
+             " ")))))
+
 (defun rmsbolt--handle-c-compile-cmd (src-buffer)
-  "Handle compile_commands.json for c/c++ for a given SRC-BUFFER.
-return t if successful."
-  (when-let ((defaults (buffer-local-value 'rmsbolt--default-variables src-buffer))
-             (default-dir (cl-find 'rmsbolt-default-directory defaults))
-             (default-cmd (cl-find 'rmsbolt-command defaults))
-             (ccj "compile_commands.json")
-             (compile-cmd-file (locate-dominating-file (buffer-file-name src-buffer) ccj))
-             (compile-cmd-file (expand-file-name ccj compile-cmd-file))
-             ;; We need a remote path to the compilation JSON so that it is
-             ;; properly parsed, but a local source file path to match the
-             ;; JSON's contents.
-             (to-ret (rmsbolt--parse-compile-commands
-                      compile-cmd-file (file-local-name (buffer-file-name src-buffer)))))
+  "Handle compile_commands.json or compile_flags.txt for c/c++ for SRC-BUFFER.
+Return t if successful."
+  (when-let* ((defaults (buffer-local-value 'rmsbolt--default-variables src-buffer))
+              (default-dir (cl-find 'rmsbolt-default-directory defaults))
+              (default-cmd (cl-find 'rmsbolt-command defaults))
+              ;; We need a remote path to the compilation JSON so that it is
+              ;; properly parsed, but a local source file path to match the
+              ;; JSON's contents.
+              (src-file (buffer-file-name src-buffer))
+              (local-src-file (file-local-name src-file))
+              (to-ret
+               (or (when-let* ((ccj "compile_commands.json")
+                               (dir (locate-dominating-file src-file ccj)))
+                     (rmsbolt--parse-compile-commands
+                      (expand-file-name ccj dir) local-src-file))
+                   (when-let* ((cft "compile_flags.txt")
+                               (dir (locate-dominating-file src-file cft)))
+                     (rmsbolt--parse-compile-flags
+                      (expand-file-name cft dir)
+                      local-src-file
+                      (with-current-buffer src-buffer
+                        (or rmsbolt-command
+                            (when-let* ((lang (rmsbolt--get-lang)))
+                              (rmsbolt-l-compile-cmd lang))
+                            "gcc")))))))
     (with-current-buffer src-buffer
+      (setq-local rmsbolt-default-directory
+                  (concat (file-remote-p src-file)
+                          (file-name-as-directory (file-local-name (cl-first to-ret)))))
       (setq-local rmsbolt-command
                   ;; Remove -c, -S, and -o <arg> if present,
                   ;; as we will add them back

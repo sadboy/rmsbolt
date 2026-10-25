@@ -293,5 +293,77 @@
       (delete-directory tmp-root t))))
 
 
+;;;; C/C++ compile_commands.json and compile_flags.txt tests
+
+(ert-deftest c-compile-cmd-flags-and-commands-test ()
+  (let* ((tmp-root (make-temp-file "rmsbolt-c-test-" t))
+         (src-dir (expand-file-name "src" tmp-root))
+         (build-dir (expand-file-name "build" tmp-root))
+         (ccj-file (expand-file-name "compile_commands.json" tmp-root))
+         (cft-file (expand-file-name "compile_flags.txt" tmp-root))
+         (file-a (expand-file-name "a.c" src-dir))
+         (file-b (expand-file-name "b.c" src-dir)))
+    (unwind-protect
+        (progn
+          (make-directory src-dir t)
+          (make-directory build-dir t)
+          (with-temp-file file-a (insert "int a(void) { return 1; }\n"))
+          (with-temp-file file-b (insert "int b(void) { return 2; }\n"))
+          (with-temp-file cft-file
+            (insert "  -I\n  include/  \n\n-O2\n-c\n-flto=thin\n-o\nignored.o\n"))
+          (with-temp-buffer
+            (setq-local buffer-file-name file-b)
+            (setq-local rmsbolt-command "gcc")
+            (setq-local rmsbolt-default-directory nil)
+            (setq-local rmsbolt--default-variables
+                        '(rmsbolt-default-directory rmsbolt-command))
+            (should (rmsbolt--handle-c-compile-cmd (current-buffer)))
+            (should (equal rmsbolt-default-directory
+                           (file-name-as-directory tmp-root)))
+            (should (equal rmsbolt-command
+                           (format "gcc -I include/ -O2 %s" file-b))))
+          (with-temp-file ccj-file
+            (insert (format "[{\"directory\": %S, \"command\": %S, \"file\": %S}]"
+                            build-dir
+                            (format "clang -Wall -O3 -c -o a.o -flto %s" file-a)
+                            file-a)))
+          (with-temp-buffer
+            (setq-local buffer-file-name file-a)
+            (setq-local rmsbolt-command "gcc")
+            (setq-local rmsbolt-default-directory nil)
+            (setq-local rmsbolt--default-variables
+                        '(rmsbolt-default-directory rmsbolt-command))
+            (should (rmsbolt--handle-c-compile-cmd (current-buffer)))
+            (should (equal rmsbolt-default-directory
+                           (file-name-as-directory build-dir)))
+            (should (equal rmsbolt-command
+                           (format "clang -Wall -O3 %s" file-a))))
+          (with-temp-buffer
+            (setq-local buffer-file-name file-b)
+            (setq-local rmsbolt-command "gcc")
+            (setq-local rmsbolt-default-directory nil)
+            (setq-local rmsbolt--default-variables
+                        '(rmsbolt-default-directory rmsbolt-command))
+            (should (rmsbolt--handle-c-compile-cmd (current-buffer)))
+            (should (equal rmsbolt-default-directory
+                           (file-name-as-directory tmp-root)))
+            (should (equal rmsbolt-command
+                           (format "gcc -I include/ -O2 %s" file-b)))))
+      (delete-directory tmp-root t))))
+
+(ert-deftest c-handle-compile-cmd-gating-test ()
+  (with-temp-buffer
+    (setq-local buffer-file-name "/tmp/nonexistent/src/main.c")
+    (setq-local rmsbolt-command "gcc-custom")
+    (setq-local rmsbolt-default-directory nil)
+    (setq-local rmsbolt--default-variables '(rmsbolt-default-directory))
+    (should-not (rmsbolt--handle-c-compile-cmd (current-buffer)))
+    (should (equal rmsbolt-command "gcc-custom"))
+    (setq-local rmsbolt-command nil)
+    (setq-local rmsbolt-default-directory "/tmp/custom-dir/")
+    (setq-local rmsbolt--default-variables '(rmsbolt-command))
+    (should-not (rmsbolt--handle-c-compile-cmd (current-buffer)))
+    (should (equal rmsbolt-default-directory "/tmp/custom-dir/"))))
+
 ;;; rmsbolt-test.el ends here
 (provide 'rmsbolt-test)
