@@ -1028,74 +1028,95 @@ return t if successful."
            when (/= x y)
            return (< x y)))
 
-(defun rmsbolt--cargo-root-declares-mod-p (root-file mod-name rel-path)
-  "Return non-nil if ROOT-FILE references MOD-NAME or REL-PATH."
-  (when (and root-file (file-readable-p root-file))
-    (with-temp-buffer
-      (insert-file-contents root-file)
-      (or (re-search-forward
-           (concat "\\_<mod[[:space:]]+\\(?:r#\\)?" (regexp-quote mod-name) "\\_>")
-           nil t)
-          (save-excursion
-            (goto-char (point-min))
-            (search-forward rel-path nil t))))))
+(defun rmsbolt--cargo-root-declares-mod-p (root-file mod-name rel-path &optional root-cache)
+  "Return non-nil if ROOT-FILE references MOD-NAME or REL-PATH.
+Optional hash table ROOT-CACHE caches file contents by ROOT-FILE."
+  (when root-file
+    (let ((content
+           (if (and root-cache (gethash root-file root-cache))
+               (gethash root-file root-cache)
+             (let ((str (if (file-readable-p root-file)
+                            (with-temp-buffer
+                              (insert-file-contents root-file)
+                              (buffer-string))
+                          'unreadable)))
+               (when root-cache
+                 (puthash root-file str root-cache))
+               str))))
+      (when (stringp content)
+        (or (string-match-p
+             (concat "\\_<mod[[:space:]]+\\(?:r#\\)?" (regexp-quote mod-name) "\\_>")
+             content)
+            (string-match-p (regexp-quote rel-path) content))))))
 
 (defun rmsbolt--cargo-find-target (metadata file &optional remote-prefix)
   "Find the best `(PKG . TARGET)' in Cargo METADATA for local FILE."
   (let* ((remote (or remote-prefix ""))
-         (true-file (file-local-name (file-truename (concat remote file))))
+         (local-file (file-local-name (expand-file-name file)))
          (packages (alist-get 'packages metadata))
+         (root-cache (make-hash-table :test #'equal))
          exact-match
          exact-prio
          best-match
          best-score)
     (cl-loop for pkg across packages do
-             (let ((pkg-dir (file-name-directory
-                             (file-local-name
-                              (file-truename
-                               (concat remote (alist-get 'manifest_path pkg)))))))
-               (cl-loop for target across (alist-get 'targets pkg) do
-                        (let* ((target-src (file-local-name
-                                            (file-truename
-                                             (concat remote (alist-get 'src_path target)))))
-                               (prio (rmsbolt--cargo-target-kind-priority
-                                      (alist-get 'kind target))))
-                          (if (equal true-file target-src)
-                              (when (or (not exact-prio) (> prio exact-prio))
-                                (setq exact-match (cons pkg target)
-                                      exact-prio prio))
-                            (let* ((target-dir (file-name-directory target-src))
-                                   (target-nondir (file-name-nondirectory target-src))
-                                   (target-stem-dir (file-name-as-directory
-                                                     (file-name-sans-extension target-src)))
-                                   (dir-score
-                                    (cond
-                                     ((and (not (member target-nondir '("lib.rs" "main.rs" "mod.rs")))
-                                           (string-prefix-p target-stem-dir true-file))
-                                      (1+ (length target-stem-dir)))
-                                     ((string-prefix-p target-dir true-file)
-                                      (length target-dir))
-                                     ((string-prefix-p pkg-dir true-file)
-                                      (length pkg-dir))
-                                     (t 0))))
-                              (when (> dir-score 0)
-                                (let* ((rel (and (string-prefix-p target-dir true-file)
-                                                 (file-relative-name true-file target-dir)))
-                                       (top-mod (and rel
-                                                     (car (split-string
-                                                           (file-name-sans-extension rel) "/"))))
-                                       (mod-match
-                                        (if (and top-mod
-                                                 (rmsbolt--cargo-root-declares-mod-p
-                                                  (concat remote target-src) top-mod rel))
-                                            1
-                                          0))
-                                       (score (list (length pkg-dir) dir-score mod-match prio)))
-                                  (when (or (not best-score)
-                                            (rmsbolt--cargo-score-less-p best-score score))
-                                    (setq best-match (cons pkg target)
-                                          best-score score))))))))))
-    (or exact-match best-match)))
+             (cl-loop for target across (alist-get 'targets pkg) do
+                      (let ((target-src (file-local-name
+                                         (expand-file-name (alist-get 'src_path target)))))
+                        (when (equal local-file target-src)
+                          (let ((prio (rmsbolt--cargo-target-kind-priority
+                                       (alist-get 'kind target))))
+                            (when (or (not exact-prio) (> prio exact-prio))
+                              (setq exact-match (cons pkg target)
+                                    exact-prio prio)))))))
+    (or exact-match
+        (progn
+          (cl-loop for pkg across packages do
+                   (let ((pkg-dir (file-name-directory
+                                   (file-local-name
+                                    (expand-file-name (alist-get 'manifest_path pkg))))))
+                     (cl-loop for target across (alist-get 'targets pkg) do
+                              (let* ((target-src (file-local-name
+                                                  (expand-file-name (alist-get 'src_path target))))
+                                     (prio (rmsbolt--cargo-target-kind-priority
+                                            (alist-get 'kind target)))
+                                     (target-dir (file-name-directory target-src))
+                                     (target-nondir (file-name-nondirectory target-src))
+                                     (target-stem-dir (file-name-as-directory
+                                                       (file-name-sans-extension target-src)))
+                                     (dir-score
+                                      (cond
+                                       ((and (not (member target-nondir '("lib.rs" "main.rs" "mod.rs")))
+                                             (string-prefix-p target-stem-dir local-file))
+                                        (1+ (length target-stem-dir)))
+                                       ((string-prefix-p target-dir local-file)
+                                        (length target-dir))
+                                       ((string-prefix-p pkg-dir local-file)
+                                        (length pkg-dir))
+                                       (t 0))))
+                                (when (and (> dir-score 0)
+                                           (or (not best-score)
+                                               (rmsbolt--cargo-score-less-p
+                                                best-score
+                                                (list (length pkg-dir) dir-score 1 prio))))
+                                  (let* ((rel (and (string-prefix-p target-dir local-file)
+                                                   (file-relative-name local-file target-dir)))
+                                         (top-mod (and rel
+                                                       (car (split-string
+                                                             (file-name-sans-extension rel) "/"))))
+                                         (mod-match
+                                          (if (and top-mod
+                                                   (rmsbolt--cargo-root-declares-mod-p
+                                                    (concat remote target-src)
+                                                    top-mod rel root-cache))
+                                              1
+                                            0))
+                                         (score (list (length pkg-dir) dir-score mod-match prio)))
+                                    (when (or (not best-score)
+                                              (rmsbolt--cargo-score-less-p best-score score))
+                                      (setq best-match (cons pkg target)
+                                            best-score score))))))))
+          best-match))))
 
 (defun rmsbolt--extract-cargo-rustc-cmd (output &optional build-script-p)
   "Extract the `rustc' command from `cargo -vv' OUTPUT.
