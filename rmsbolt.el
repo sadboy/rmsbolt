@@ -454,18 +454,11 @@ Return value is quoted for passing to the shell."
   `(set (make-local-variable ,var) ,val))
 
 (defun rmsbolt--file-equal-p (src-path target-path)
-  "Determine if SRC-PATH and TARGET-PATH refer to the same file.
-Checks the existence of the file when the paths are either both local or remote,
-otherwise returns whether the paths are equal and does not check whether they
-point to a file that exists."
-  ;; When possible verify the file's existence, otherwise fall back to comparing
-  ;; paths.  The fallback is necessary when the paths provided are the local
-  ;; components of remote paths that don't exist on the current system.
-  (or (and (equal (file-remote-p src-path)
-                  (file-remote-p target-path))
-           (file-equal-p src-path target-path))
-      (equal (file-local-name src-path)
-             (file-local-name target-path))))
+  "Return non-nil if SRC-PATH and TARGET-PATH refer to the same file."
+  (let ((default-directory (and default-directory
+                                (file-local-name default-directory))))
+    (equal (expand-file-name (file-local-name src-path))
+           (expand-file-name (file-local-name target-path)))))
 
 ;;;; Language Functions
 ;;;;; Compile Commands
@@ -1342,29 +1335,20 @@ Argument SRC-BUFFER source buffer."
              (used-label-p (gethash match used-labels)))
         (catch 'continue
           (cond
-           ;; Process file name hints
            ((string-match rmsbolt-source-file line)
-            (if (match-string 3 line)
-                ;; Clang style match
-                (puthash (string-to-number (match-string 1 line))
-                         (expand-file-name (match-string 3 line) (match-string 2 line))
-                         source-file-map)
+            (let* ((file (if (match-string 3 line)
+                             (expand-file-name (match-string 3 line) (match-string 2 line))
+                           (match-string 2 line)))
+                   (match-p (or (not src-file-name)
+                                (let ((default-directory def-dir))
+                                  (rmsbolt--file-equal-p local-src-file-name file)))))
               (puthash (string-to-number (match-string 1 line))
-                       (match-string 2 line)
+                       match-p
                        source-file-map)))
-           ;; Process any line number hints
            ((string-match rmsbolt-source-tag line)
-            (if (or (not src-file-name) ;; Skip file match if we don't have a current filename
-                    ;; If we get a non-absolute .file path, check to see if we
-                    ;; have a default dir. If not, treat it like we are in the
-                    ;; src directory.
-                    (let ((default-directory def-dir))
-                      (rmsbolt--file-equal-p local-src-file-name
-                             (gethash
-                              (string-to-number (match-string 1 line))
-                              source-file-map
-                              ;; Assume we never will compile dev null :P
-                              "/dev/null"))))
+            (if (or (not src-file-name)
+                    (gethash (string-to-number (match-string 1 line))
+                             source-file-map))
                 (setq source-linum (string-to-number
                                     (match-string 2 line)))
               (setq source-linum nil)))
