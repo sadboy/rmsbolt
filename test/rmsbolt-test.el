@@ -124,7 +124,9 @@ stored out of order to exercise sorting."
            (with-current-buffer src-buffer
              (setq rmsbolt-line-mapping (make-hash-table :test #'eq))
              (puthash 5 '((6 . 7) (1 . 2)) rmsbolt-line-mapping)
-             (puthash 6 '((4 . 4)) rmsbolt-line-mapping))
+             (puthash 6 '((4 . 4)) rmsbolt-line-mapping)
+             (setq-local rmsbolt-mode t)
+             (insert "one\ntwo\nthree\nfour\nfive\nsix\n"))
            (with-current-buffer output-buffer
              (erase-buffer)
              (insert "a\nb\nc\nd\ne\nf\ng\nh\n")
@@ -136,17 +138,23 @@ stored out of order to exercise sorting."
                  (add-text-properties (line-beginning-position)
                                       (line-end-position)
                                       `(rmsbolt-src-line ,(nth 2 chunk)))
-                 (forward-line 1))))
+                 (forward-line 1)))
+             (goto-char (point-min)))
            ,@body)
        (kill-buffer src-buffer)
        (kill-buffer output-buffer))))
 
+(defun rmsbolt-test--output-line ()
+  "Return the line number at point in the fake rmsbolt output buffer."
+  (with-current-buffer rmsbolt-output-buffer
+    (line-number-at-pos)))
+
 (ert-deftest output-chunks-sorted-test ()
   (rmsbolt-test--with-chunk-buffers
     (with-current-buffer rmsbolt-output-buffer
-      (should (equal (rmsbolt--output-chunks 5) '((1 . 2) (6 . 7))))
-      (should (equal (rmsbolt--output-chunks 6) '((4 . 4))))
-      (should-not (rmsbolt--output-chunks 42)))
+      (should (equal (rmsbolt--output-chunks src-buffer 5) '((1 . 2) (6 . 7))))
+      (should (equal (rmsbolt--output-chunks src-buffer 6) '((4 . 4))))
+      (should-not (rmsbolt--output-chunks src-buffer 42)))
     ;; Sorting must not change the stored mapping.
     (with-current-buffer src-buffer
       (should (equal (gethash 5 rmsbolt-line-mapping) '((6 . 7) (1 . 2)))))))
@@ -174,6 +182,42 @@ stored out of order to exercise sorting."
       (rmsbolt-output-backward-chunk)
       (should (= (line-number-at-pos) 4)))))
 
+(ert-deftest output-chunk-source-buffer-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-current-buffer src-buffer
+      ;; Source line 5 has two chunks.  The output starts focused on line 1.
+      (goto-char (point-min))
+      (forward-line 4)
+      (rmsbolt-output-forward-chunk)
+      (should (= (rmsbolt-test--output-line) 6))
+      (rmsbolt-output-forward-chunk)
+      (should (= (rmsbolt-test--output-line) 1))
+      (rmsbolt-output-backward-chunk)
+      (should (= (rmsbolt-test--output-line) 6))
+      ;; A focus outside the chunks starts at the first chunk.
+      (with-current-buffer rmsbolt-output-buffer
+        (goto-char (point-min))
+        (forward-line 2))
+      (rmsbolt-output-forward-chunk)
+      (should (= (rmsbolt-test--output-line) 1))
+      ;; A single-chunk source line does not move the focus.
+      (with-current-buffer rmsbolt-output-buffer
+        (goto-char (point-min))
+        (forward-line 2))
+      (goto-char (point-min))
+      (forward-line 5)
+      (rmsbolt-output-forward-chunk)
+      (should (= (rmsbolt-test--output-line) 3))
+      ;; Unmapped source lines signal an error.
+      (goto-char (point-min))
+      (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
+      (should-error (rmsbolt-output-backward-chunk) :type 'user-error))))
+
+(ert-deftest output-chunk-keybindings-test ()
+  (should (eq (lookup-key rmsbolt-mode-map (kbd "C-c C-n"))
+              #'rmsbolt-output-forward-chunk))
+  (should (eq (lookup-key rmsbolt-mode-map (kbd "C-c C-p"))
+              #'rmsbolt-output-backward-chunk)))
 (ert-deftest output-chunk-unmapped-position-test ()
   (rmsbolt-test--with-chunk-buffers
     (with-current-buffer rmsbolt-output-buffer
@@ -185,6 +229,11 @@ stored out of order to exercise sorting."
 (ert-deftest output-chunk-outside-output-buffer-test ()
   (rmsbolt-test--with-chunk-buffers
     (with-temp-buffer
+      (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
+      (should-error (rmsbolt-output-backward-chunk) :type 'user-error))
+    ;; `rmsbolt-mode' in a buffer that is not linked to the output buffer.
+    (with-temp-buffer
+      (setq-local rmsbolt-mode t)
       (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
       (should-error (rmsbolt-output-backward-chunk) :type 'user-error))))
 

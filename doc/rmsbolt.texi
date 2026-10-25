@@ -116,9 +116,10 @@ the default @code{C-c C-c} binding to pop open a disassembly buffer. After the f
 run, the buffer should automatically update.
 
 When a source line compiles to several disjoint regions of assembly, use the
-@code{rmsbolt-output-forward-chunk} and @code{rmsbolt-output-backward-chunk}
-commands to move point through those regions in the output buffer.  The
-commands wrap around at the ends and have no default key bindings.
+@code{C-c C-n} (@code{rmsbolt-output-forward-chunk}) and @code{C-c C-p}
+(@code{rmsbolt-output-backward-chunk}) bindings to cycle focus through those
+regions.  The commands work in the output buffer and in the source buffer under
+@code{rmsbolt-mode}, and wrap around at the ends.
 
 @node Configuring
 @chapter Configuring

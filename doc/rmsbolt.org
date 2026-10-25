@@ -42,9 +42,10 @@ the default ~C-c C-c~ binding to pop open a disassembly buffer. After the first
 run, the buffer should automatically update.
 
 When a source line compiles to several disjoint regions of assembly, use the
-~rmsbolt-output-forward-chunk~ and ~rmsbolt-output-backward-chunk~ commands to
-move point through those regions in the output buffer.  The commands wrap
-around at the ends and have no default key bindings.
+~C-c C-n~ (~rmsbolt-output-forward-chunk~) and ~C-c C-p~
+(~rmsbolt-output-backward-chunk~) bindings to cycle focus through those
+regions.  The commands work in the output buffer and in the source buffer under
+~rmsbolt-mode~, and wrap around at the ends.
 * Configuring
 
 RMSbolt is primarily configured with Emacs local variables. This lets you change
