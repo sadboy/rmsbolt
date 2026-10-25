@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Emacs ${{ matrix.emacs-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs-version:
+          - '31.1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jcs090218/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cask
+          key: cask-${{ runner.os }}-${{ matrix.emacs-version }}-${{ hashFiles('Cask') }}
+
+      - name: Install Cask
+        run: |
+          if [ ! -x "$HOME/.cask/bin/cask" ]; then
+            git clone --depth 1 https://github.com/cask/cask "$HOME/.cask"
+          fi
+          echo "$HOME/.cask/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: cask install
+
+      - name: Run tests
+        run: cask exec ert-runner
