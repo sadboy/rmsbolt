@@ -487,7 +487,7 @@ Use SRC-BUFFER as buffer containing local variables."
           (cmd (buffer-local-value 'rmsbolt-command src-buffer))
           (cmd (string-join
                 (list cmd
-                      "-g"
+                      "-g1"
                       (if disass
                           "-c"
                         "-S")
@@ -617,7 +617,7 @@ Use SRC-BUFFER as buffer for local variables."
           (cmd (buffer-local-value 'rmsbolt-command src-buffer))
           (cmd (string-join
                 (list cmd
-                      "-g"
+                      "-C" "debuginfo=1"
                       "--emit"
                       (if disass
                           "link"
