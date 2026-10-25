@@ -1028,33 +1028,91 @@ return t if successful."
            when (/= x y)
            return (< x y)))
 
+(defun rmsbolt--cargo-sanitize-rust-source (source)
+  "Return `(NO-COMMENTS . NO-STRINGS)' for Rust SOURCE."
+  (let* ((no-comments
+          (replace-regexp-in-string
+           (rx (or (seq "//" (0+ nonl))
+                   (seq "/*" (minimal-match (0+ anything)) "*/")))
+           " "
+           source))
+         (no-strings
+          (replace-regexp-in-string
+           (rx "\"" (0+ (or (seq "\\" anything) (not (any "\"\\")))) "\"")
+           "\"\""
+           no-comments)))
+    (cons no-comments no-strings)))
+
 (defun rmsbolt--cargo-root-declares-mod-p (root-file mod-name rel-path &optional root-cache)
-  "Return non-nil if ROOT-FILE references MOD-NAME or REL-PATH.
-Optional hash table ROOT-CACHE caches file contents by ROOT-FILE."
+  "Return non-nil if ROOT-FILE declares module MOD-NAME or path attribute REL-PATH.
+Optional hash table ROOT-CACHE caches sanitized file contents by ROOT-FILE."
   (when root-file
-    (let ((content
+    (let ((entry
            (if (and root-cache (gethash root-file root-cache))
                (gethash root-file root-cache)
-             (let ((str (if (file-readable-p root-file)
+             (let ((val (if (file-readable-p root-file)
                             (with-temp-buffer
                               (insert-file-contents root-file)
-                              (buffer-string))
+                              (rmsbolt--cargo-sanitize-rust-source (buffer-string)))
                           'unreadable)))
                (when root-cache
-                 (puthash root-file str root-cache))
-               str))))
-      (when (stringp content)
+                 (puthash root-file val root-cache))
+               val))))
+      (when (consp entry)
         (or (string-match-p
              (concat "\\_<mod[[:space:]]+\\(?:r#\\)?" (regexp-quote mod-name) "\\_>")
-             content)
-            (string-match-p (regexp-quote rel-path) content))))))
+             (cdr entry))
+            (string-match-p
+             (rx "#[" (0+ space) "path" (0+ space) "=" (0+ space)
+                 "\"" (literal rel-path) "\"")
+             (car entry)))))))
+
+(defun rmsbolt--cargo-dep-info-member-p (deps-dir workspace-root target target-src local-file dep-cache)
+  "Return non-nil if Cargo dep-info in DEPS-DIR lists LOCAL-FILE under TARGET."
+  (when (and deps-dir workspace-root)
+    (let ((dir-ok (gethash :dir-exists dep-cache 'unset)))
+      (when (eq dir-ok 'unset)
+        (setq dir-ok (file-directory-p deps-dir))
+        (puthash :dir-exists dir-ok dep-cache))
+      (when dir-ok
+        (let* ((crate-name (replace-regexp-in-string "-" "_" (alist-get 'name target)))
+               (entries (gethash crate-name dep-cache 'unset)))
+          (when (eq entries 'unset)
+            (setq entries nil)
+            (dolist (d-file (directory-files
+                             deps-dir t
+                             (concat "\\`" (regexp-quote crate-name) "-[0-9a-f]+\\.d\\'")))
+              (when (file-readable-p d-file)
+                (with-temp-buffer
+                  (insert-file-contents d-file nil 0 8192)
+                  (goto-char (point-min))
+                  (let ((line (buffer-substring-no-properties
+                               (point-min) (line-end-position))))
+                    (when (string-match ":[[:space:]]+\\(.+\\)\\'" line)
+                      (let ((files
+                             (mapcar (lambda (p)
+                                       (file-local-name
+                                        (expand-file-name p workspace-root)))
+                                     (split-string (match-string 1 line) "[ \t\r\n]+" t))))
+                        (when files
+                          (push files entries))))))))
+            (puthash crate-name entries dep-cache))
+          (cl-some (lambda (files)
+                     (and (equal (car files) target-src)
+                          (member local-file files)))
+                   entries))))))
 
 (defun rmsbolt--cargo-find-target (metadata file &optional remote-prefix)
   "Find the best `(PKG . TARGET)' in Cargo METADATA for local FILE."
   (let* ((remote (or remote-prefix ""))
          (local-file (file-local-name (expand-file-name file)))
+         (workspace-root (alist-get 'workspace_root metadata))
+         (target-directory (alist-get 'target_directory metadata))
+         (deps-dir (and target-directory
+                        (expand-file-name "debug/deps" (concat remote target-directory))))
          (packages (alist-get 'packages metadata))
          (root-cache (make-hash-table :test #'equal))
+         (dep-cache (make-hash-table :test #'equal))
          exact-match
          exact-prio
          best-match
@@ -1098,24 +1156,37 @@ Optional hash table ROOT-CACHE caches file contents by ROOT-FILE."
                                            (or (not best-score)
                                                (rmsbolt--cargo-score-less-p
                                                 best-score
-                                                (list (length pkg-dir) dir-score 1 prio))))
-                                  (let* ((rel (and (string-prefix-p target-dir local-file)
+                                                (list (length pkg-dir) 1 dir-score 1 prio))))
+                                  (let* ((dep-match
+                                          (if (rmsbolt--cargo-dep-info-member-p
+                                               deps-dir workspace-root target
+                                               target-src local-file dep-cache)
+                                              1
+                                            0))
+                                         (rel (and (string-prefix-p target-dir local-file)
                                                    (file-relative-name local-file target-dir)))
                                          (top-mod (and rel
                                                        (car (split-string
                                                              (file-name-sans-extension rel) "/"))))
                                          (mod-match
-                                          (if (and top-mod
+                                          (if (and (= dep-match 0)
+                                                   top-mod
                                                    (rmsbolt--cargo-root-declares-mod-p
                                                     (concat remote target-src)
                                                     top-mod rel root-cache))
                                               1
                                             0))
-                                         (score (list (length pkg-dir) dir-score mod-match prio)))
+                                         (score (list (length pkg-dir) dep-match dir-score mod-match prio)))
                                     (when (or (not best-score)
                                               (rmsbolt--cargo-score-less-p best-score score))
                                       (setq best-match (cons pkg target)
                                             best-score score))))))))
+          (when (and best-match
+                     (= (nth 1 best-score) 0)
+                     (= (nth 3 best-score) 0))
+            (message "RMSBolt: guessing Cargo target `%s' for %s"
+                     (alist-get 'name (cdr best-match))
+                     (file-name-nondirectory local-file)))
           best-match))))
 
 (defun rmsbolt--extract-cargo-rustc-cmd (output &optional build-script-p)
