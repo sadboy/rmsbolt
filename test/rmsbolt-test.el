@@ -109,6 +109,84 @@
        (make-rmsbolt-lang :demangler "test")
        (current-buffer))))))
 
+;;;; Output chunk navigation tests
+
+(defmacro rmsbolt-test--with-chunk-buffers (&rest body)
+  "Run BODY with a fake rmsbolt output buffer and its source buffer.
+The output buffer has eight lines.  Source line 5 maps to the chunks on
+lines 1-2 and 6-7, and source line 6 maps to line 4.  The mapping is
+stored out of order to exercise sorting."
+  (declare (indent 0) (debug (body)))
+  `(let ((src-buffer (generate-new-buffer " *rmsbolt-test-src*"))
+         (output-buffer (get-buffer-create rmsbolt-output-buffer)))
+     (unwind-protect
+         (progn
+           (with-current-buffer src-buffer
+             (setq rmsbolt-line-mapping (make-hash-table :test #'eq))
+             (puthash 5 '((6 . 7) (1 . 2)) rmsbolt-line-mapping)
+             (puthash 6 '((4 . 4)) rmsbolt-line-mapping))
+           (with-current-buffer output-buffer
+             (erase-buffer)
+             (insert "a\nb\nc\nd\ne\nf\ng\nh\n")
+             (setq rmsbolt-src-buffer src-buffer)
+             (dolist (chunk '((1 2 5) (4 4 6) (6 7 5)))
+               (goto-char (point-min))
+               (forward-line (1- (nth 0 chunk)))
+               (dotimes (_ (1+ (- (nth 1 chunk) (nth 0 chunk))))
+                 (add-text-properties (line-beginning-position)
+                                      (line-end-position)
+                                      `(rmsbolt-src-line ,(nth 2 chunk)))
+                 (forward-line 1))))
+           ,@body)
+       (kill-buffer src-buffer)
+       (kill-buffer output-buffer))))
+
+(ert-deftest output-chunks-sorted-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-current-buffer rmsbolt-output-buffer
+      (should (equal (rmsbolt--output-chunks 5) '((1 . 2) (6 . 7))))
+      (should (equal (rmsbolt--output-chunks 6) '((4 . 4))))
+      (should-not (rmsbolt--output-chunks 42)))
+    ;; Sorting must not change the stored mapping.
+    (with-current-buffer src-buffer
+      (should (equal (gethash 5 rmsbolt-line-mapping) '((6 . 7) (1 . 2)))))))
+
+(ert-deftest output-chunk-forward-and-backward-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-current-buffer rmsbolt-output-buffer
+      (goto-char (point-min))
+      (rmsbolt-output-forward-chunk)
+      (should (= (line-number-at-pos) 6))
+      (rmsbolt-output-forward-chunk)
+      (should (= (line-number-at-pos) 1))
+      (rmsbolt-output-backward-chunk)
+      (should (= (line-number-at-pos) 6))
+      (rmsbolt-output-backward-chunk)
+      (should (= (line-number-at-pos) 1)))))
+
+(ert-deftest output-chunk-single-chunk-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-current-buffer rmsbolt-output-buffer
+      (goto-char (point-min))
+      (forward-line 3)
+      (rmsbolt-output-forward-chunk)
+      (should (= (line-number-at-pos) 4))
+      (rmsbolt-output-backward-chunk)
+      (should (= (line-number-at-pos) 4)))))
+
+(ert-deftest output-chunk-unmapped-position-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-current-buffer rmsbolt-output-buffer
+      (goto-char (point-min))
+      (forward-line 2)
+      (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
+      (should-error (rmsbolt-output-backward-chunk) :type 'user-error))))
+
+(ert-deftest output-chunk-outside-output-buffer-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (with-temp-buffer
+      (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
+      (should-error (rmsbolt-output-backward-chunk) :type 'user-error))))
 
 ;;;; Cargo integration tests
 

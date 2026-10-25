@@ -40,6 +40,11 @@ Once installed, use the ~rmsbolt-starter~ command to generate starter files, or
 enable ~rmsbolt-mode~ in a supported language. Then run ~rmsbolt-compile~ or use
 the default ~C-c C-c~ binding to pop open a disassembly buffer. After the first
 run, the buffer should automatically update.
+
+When a source line compiles to several disjoint regions of assembly, use the
+~rmsbolt-output-forward-chunk~ and ~rmsbolt-output-backward-chunk~ commands to
+move point through those regions in the output buffer.  The commands wrap
+around at the ends and have no default key bindings.
 * Configuring
 
 RMSbolt is primarily configured with Emacs local variables. This lets you change

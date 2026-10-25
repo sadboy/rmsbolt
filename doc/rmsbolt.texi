@@ -115,6 +115,11 @@ enable @code{rmsbolt-mode} in a supported language. Then run @code{rmsbolt-compi
 the default @code{C-c C-c} binding to pop open a disassembly buffer. After the first
 run, the buffer should automatically update.
 
+When a source line compiles to several disjoint regions of assembly, use the
+@code{rmsbolt-output-forward-chunk} and @code{rmsbolt-output-backward-chunk}
+commands to move point through those regions in the output buffer.  The
+commands wrap around at the ends and have no default key bindings.
+
 @node Configuring
 @chapter Configuring
 

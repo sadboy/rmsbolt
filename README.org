@@ -68,6 +68,11 @@ for code region highlighting and automatic recompilation on buffer changes.
 
 ~rmsbolt-mode~ also adds the key binding ~C-c C-c~ to run a compilation.
 
+When a source line compiles to several disjoint regions of assembly, use
+~M-x rmsbolt-output-forward-chunk~ and ~M-x rmsbolt-output-backward-chunk~ to
+move point through those regions in the output buffer.  The commands wrap
+around at the ends and have no default key bindings.
+
 Run ~rmsbolt-starter~ to generate an example source file for one of the supported languages.
 
 Run ~rmsbolt-compile~ to start a compilation without enabling ~rmsbolt-mode~.
