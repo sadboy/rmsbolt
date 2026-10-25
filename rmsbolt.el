@@ -1128,58 +1128,106 @@ If BUILD-SCRIPT-P is non-nil, match the build script command."
         (concat "env " cleaned)
       cleaned)))
 
+(defun rmsbolt--cargo-format-error (output)
+  "Format Cargo error OUTPUT as a single truncated line."
+  (let* ((trimmed (string-trim (or output "")))
+         (summary
+          (if (string-match
+               (rx line-start (0+ blank) "error" (opt "[" (1+ alnum) "]") ":" (0+ nonl))
+               trimmed)
+              (string-trim (match-string 0 trimmed))
+            (replace-regexp-in-string "[ \t\n\r]+" " " trimmed))))
+    (truncate-string-to-width
+     (if (string-empty-p summary) "unknown cargo error" summary)
+     200 nil nil "...")))
+
 (defun rmsbolt--parse-cargo-compile-cmd (manifest-dir file)
   "Invoke Cargo in MANIFEST-DIR and extract the compile dir and command for FILE."
   (let* ((default-directory manifest-dir)
          (remote (file-remote-p manifest-dir))
          (json-object-type 'alist)
          (json-array-type 'vector)
+         meta-err
          (metadata
           (with-temp-buffer
-            (when (zerop (condition-case nil
-                             (process-file "cargo" nil (list (current-buffer) nil) nil
-                                           "metadata" "--no-deps" "--format-version" "1")
-                           (error 1)))
-              (goto-char (point-min))
-              (condition-case nil
-                  (json-read)
-                (error nil))))))
-    (when-let* ((workspace-root (alist-get 'workspace_root metadata))
-               (workspace-dir (concat remote (file-name-as-directory workspace-root)))
-               (match (rmsbolt--cargo-find-target metadata file remote))
-               (pkg (car match))
-               (target (cdr match))
-               (pkg-name (alist-get 'name pkg))
-               (target-args (rmsbolt--cargo-target-args target)))
-      (let* ((default-directory workspace-dir)
-             (build-script-p (eq target-args 'custom-build))
-             (cargo-args
-              (if build-script-p
-                  (let ((other-args
-                         (cl-loop for tgt across (alist-get 'targets pkg)
-                                  for args = (rmsbolt--cargo-target-args tgt)
-                                  when (and args (not (eq args 'custom-build)))
-                                  return args)))
-                    (if other-args
-                        (append (list "rustc" "-p" pkg-name)
-                                other-args
-                                '("-vv" "--" "--print" "crate-name"))
-                      (list "check" "-p" pkg-name "-vv")))
-                (append (list "rustc" "-p" pkg-name)
-                        target-args
-                        '("-vv" "--" "--print" "crate-name"))))
-             (output
-              (with-temp-buffer
-                (when build-script-p
-                  (ignore-errors (set-file-times (concat remote file))))
-                (when (zerop (condition-case nil
-                                 (apply #'process-file "cargo" nil t nil cargo-args)
-                               (error 1)))
-                  (buffer-string))))
-             (raw-cmd (and output
-                           (rmsbolt--extract-cargo-rustc-cmd output build-script-p))))
-        (when raw-cmd
-          (list workspace-dir (rmsbolt--clean-cargo-rustc-cmd raw-cmd)))))))
+            (if (zerop (condition-case err
+                           (process-file "cargo" nil t nil
+                                         "metadata" "--no-deps" "--format-version" "1")
+                         (error
+                          (insert (error-message-string err))
+                          1)))
+                (progn
+                  (goto-char (point-min))
+                  (when (re-search-forward "^[[:space:]]*{" nil t)
+                    (goto-char (match-beginning 0)))
+                  (condition-case err
+                      (json-read)
+                    (error
+                     (setq meta-err (error-message-string err))
+                     nil)))
+              (setq meta-err (buffer-string))
+              nil))))
+    (if (not metadata)
+        (progn
+          (message "RMSBolt: Cargo integration failed: %s"
+                   (rmsbolt--cargo-format-error meta-err))
+          nil)
+      (let* ((workspace-root (alist-get 'workspace_root metadata))
+             (workspace-dir (and workspace-root
+                                 (concat remote (file-name-as-directory workspace-root))))
+             (match (and workspace-dir
+                         (rmsbolt--cargo-find-target metadata file remote)))
+             (pkg (car-safe match))
+             (target (cdr-safe match))
+             (pkg-name (alist-get 'name pkg))
+             (target-args (and target (rmsbolt--cargo-target-args target))))
+        (if (not (and workspace-dir pkg-name target-args))
+            (progn
+              (message "RMSBolt: Cargo integration failed: no target found for %s" file)
+              nil)
+          (let* ((default-directory workspace-dir)
+                 (build-script-p (eq target-args 'custom-build))
+                 (cargo-args
+                  (if build-script-p
+                      (let ((other-args
+                             (cl-loop for tgt across (alist-get 'targets pkg)
+                                      for args = (rmsbolt--cargo-target-args tgt)
+                                      when (and args (not (eq args 'custom-build)))
+                                      return args)))
+                        (if other-args
+                            (append (list "rustc" "-p" pkg-name)
+                                    other-args
+                                    '("-vv" "--" "--print" "crate-name"))
+                          (list "check" "-p" pkg-name "-vv")))
+                    (append (list "rustc" "-p" pkg-name)
+                            target-args
+                            '("-vv" "--" "--print" "crate-name"))))
+                 cmd-err
+                 (output
+                  (with-temp-buffer
+                    (when build-script-p
+                      (ignore-errors (set-file-times (concat remote file))))
+                    (if (zerop (condition-case err
+                                   (apply #'process-file "cargo" nil t nil cargo-args)
+                                 (error
+                                  (insert (error-message-string err))
+                                  1)))
+                        (buffer-string)
+                      (setq cmd-err (buffer-string))
+                      nil)))
+                 (raw-cmd (and output
+                               (rmsbolt--extract-cargo-rustc-cmd output build-script-p))))
+            (cond
+             (raw-cmd
+              (list workspace-dir (rmsbolt--clean-cargo-rustc-cmd raw-cmd)))
+             (cmd-err
+              (message "RMSBolt: Cargo integration failed: %s"
+                       (rmsbolt--cargo-format-error cmd-err))
+              nil)
+             (t
+              (message "RMSBolt: Cargo integration failed: could not extract rustc command for %s"
+                       pkg-name)
+              nil))))))))
 
 (defun rmsbolt--handle-rust-compile-cmd (src-buffer)
   "Handle Cargo integration for Rust for a given SRC-BUFFER.
