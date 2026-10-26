@@ -522,6 +522,172 @@ stored out of order to exercise sorting."
       (kill-buffer compilation-buffer)
       (delete-directory temp-dir t))))
 
+
+;;;; Compile arg override tests
+
+(defmacro rmsbolt-test--with-read-string (input &rest body)
+  "Evaluate BODY with `read-string' returning INPUT."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'read-string) (lambda (&rest _) ,input)))
+     ,@body))
+
+(ert-deftest compile-arg-overrides-read-test ()
+  (with-temp-buffer
+    (setq major-mode 'c-mode)
+    (rmsbolt-test--with-read-string "-O3 -march native"
+      (should (equal (rmsbolt--read-compile-arg-overrides)
+                     "-O3 -march native")))
+    (rmsbolt-test--with-read-string "-std=c++17 -mtune=generic"
+      (should (equal (rmsbolt--read-compile-arg-overrides)
+                     "-std=c++17 -mtune=generic")))
+    (rmsbolt-test--with-read-string ""
+      (should (equal (rmsbolt--read-compile-arg-overrides) "")))
+    ;; Uninteresting arguments are rejected.
+    (rmsbolt-test--with-read-string "-O3 -Wall -I/usr/include"
+      (should-error (rmsbolt--read-compile-arg-overrides) :type 'user-error)))
+  (with-temp-buffer
+    (setq major-mode 'rust-mode)
+    (rmsbolt-test--with-read-string "-C opt-level=3 -C target-cpu=native"
+      (should (equal (rmsbolt--read-compile-arg-overrides)
+                     "-C opt-level=3 -C target-cpu=native")))
+    (rmsbolt-test--with-read-string "-C opt-level=3 -C debuginfo=2"
+      (should-error (rmsbolt--read-compile-arg-overrides)
+                    :type 'user-error)))
+  ;; A user supplied alist decides what is interesting.
+  (let ((rmsbolt-output-header-arg-alist '((t ("^-f" . nil)))))
+    (with-temp-buffer
+      (setq major-mode 'c-mode)
+      (rmsbolt-test--with-read-string "-fno-exceptions"
+        (should (equal (rmsbolt--read-compile-arg-overrides)
+                       "-fno-exceptions")))
+      (rmsbolt-test--with-read-string "-O2"
+        (should-error (rmsbolt--read-compile-arg-overrides)
+                      :type 'user-error)))))
+
+(ert-deftest compile-arg-overrides-apply-test ()
+  (should (equal (rmsbolt--apply-arg-overrides
+                  "gcc -g1 -S src.c -o out.s" "-O3 -march=native")
+                 "gcc -g1 -S src.c -o out.s -O3 -march=native"))
+  ;; Commands chained after the compiler invocation must not receive them.
+  (should (equal (rmsbolt--apply-arg-overrides
+                  "gcc -g1 -c src.c -o out && objdump -d out > out.s" "-O3")
+                 "gcc -g1 -c src.c -o out -O3 && objdump -d out > out.s"))
+  (should (equal (rmsbolt--apply-arg-overrides "gcc -O2" nil) "gcc -O2"))
+  (should (equal (rmsbolt--apply-arg-overrides "gcc -O2" "") "gcc -O2")))
+
+(ert-deftest output-header-args-overrides-test ()
+  (should (equal (rmsbolt--header-args
+                  "gcc -O2 -march=native -Wall" rmsbolt-test--header-specs
+                  "-O3 -mtune=generic")
+                 "-O2 -march=native -O3 -mtune=generic"))
+  ;; Overrides pass through the same filtering as the command.
+  (should (equal (rmsbolt--header-args
+                  "gcc -O2" rmsbolt-test--header-specs "-Wall -O3")
+                 "-O2 -O3"))
+  ;; Without overrides the header is unchanged.
+  (should (equal (rmsbolt--header-args
+                  "gcc -O2" rmsbolt-test--header-specs)
+                 "-O2"))
+  (should (equal (rmsbolt--output-header-line
+                  "gcc -O2" rmsbolt-test--header-specs "-O3 -march=native")
+                 ";; compiled with: gcc -O2 -O3 -march=native")))
+
+(ert-deftest compile-arg-overrides-end-to-end-test ()
+  (let* ((temp-dir (make-temp-file "rmsbolt-override-test-" t))
+         (rmsbolt--temp-dir temp-dir)
+         (rmsbolt-output-buffer "*rmsbolt-test-override-output*")
+         (src-buffer (generate-new-buffer " *rmsbolt-test-override-src*"))
+         (compilation-buffer (generate-new-buffer
+                              " *rmsbolt-test-override-compile*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer src-buffer
+            (setq default-directory temp-dir)
+            (insert "int main(void) { return 0; }\n")
+            (setq-local rmsbolt-command "gcc -O2")
+            (setq-local rmsbolt-compile-arg-overrides "-O3 -march=native")
+            (setq-local rmsbolt-language-descriptor
+                        (make-rmsbolt-lang :supports-asm t :supports-disass nil))
+            (setq-local rmsbolt-disassemble nil)
+            (setq-local rmsbolt-filter-directives nil)
+            (setq-local rmsbolt-filter-labels nil)
+            (setq-local rmsbolt-filter-comment-only nil))
+          (with-temp-file (expand-file-name "rmsbolt.s" temp-dir)
+            (insert "\t.text\nmain:\n\t.loc 1 2 0\n\tpush\trbp\n\tret\n"))
+          (with-current-buffer compilation-buffer
+            (setq default-directory temp-dir)
+            (setq rmsbolt-src-buffer src-buffer))
+          (cl-letf (((symbol-function 'rmsbolt-mode) #'ignore)
+                    ((symbol-function 'display-buffer) #'ignore)
+                    ((symbol-function 'run-at-time) #'ignore))
+            (rmsbolt--handle-finish-compile compilation-buffer nil))
+          (let ((output-buffer (get-buffer rmsbolt-output-buffer)))
+            (should output-buffer)
+            (with-current-buffer output-buffer
+              (should (equal (buffer-substring-no-properties
+                              (point-min) (line-end-position))
+                             ";; compiled with: gcc -O2 -O3 -march=native"))))
+          ;; The overrides stay in effect for the buffer.
+          (with-current-buffer src-buffer
+            (should (equal rmsbolt-compile-arg-overrides
+                           "-O3 -march=native"))))
+      (kill-buffer src-buffer)
+      (when (get-buffer rmsbolt-output-buffer)
+        (kill-buffer (get-buffer rmsbolt-output-buffer)))
+      (kill-buffer compilation-buffer)
+      (delete-directory temp-dir t))))
+
+(ert-deftest compile-arg-overrides-in-compile-command-test ()
+  (let* ((temp-dir (make-temp-file "rmsbolt-override-cmd-test-" t))
+         (rmsbolt--temp-dir temp-dir)
+         (src-file (expand-file-name "rmsbolt.c" temp-dir))
+         (src-buffer (generate-new-buffer " *rmsbolt-test-override-cmd-src*"))
+         (cmd nil))
+    (unwind-protect
+        (progn
+          (with-temp-file src-file
+            (insert "int main(void) { return 0; }\n"))
+          (with-current-buffer src-buffer
+            (setq default-directory temp-dir)
+            (setq buffer-file-name src-file)
+            (insert-file-contents src-file)
+            (set-buffer-modified-p nil)
+            (setq-local rmsbolt-command "gcc -O2")
+            (setq-local rmsbolt-language-descriptor
+                        (make-rmsbolt-lang
+                         :supports-asm t :supports-disass nil
+                         :compile-cmd-function
+                         (lambda (&key _src-buffer)
+                           (concat (buffer-local-value 'rmsbolt-command
+                                                       (current-buffer))
+                                   " -S rmsbolt.c -o rmsbolt.s"))))
+            (cl-letf (((symbol-function 'rmsbolt--gen-temp) #'ignore)
+                      ((symbol-function 'compilation-start)
+                       (lambda (command &rest _)
+                         (setq cmd command)
+                         (current-buffer)))
+                      ((symbol-function 'display-buffer) #'ignore))
+              (rmsbolt-compile "-O3 -march=native")
+              (should (equal cmd "gcc -O2 -S rmsbolt.c -o rmsbolt.s -O3 -march=native"))
+              (should (equal rmsbolt-compile-arg-overrides "-O3 -march=native"))
+              ;; A later compilation keeps the overrides.
+              (rmsbolt-compile)
+              (should (equal cmd
+                             "gcc -O2 -S rmsbolt.c -o rmsbolt.s -O3 -march=native"))
+              ;; A prefix argument prompts for and replaces the overrides.
+              (let ((current-prefix-arg '(4)))
+                (rmsbolt-test--with-read-string "-Os"
+                  (call-interactively #'rmsbolt-compile)))
+              (should (equal cmd "gcc -O2 -S rmsbolt.c -o rmsbolt.s -Os"))
+              (should (equal rmsbolt-compile-arg-overrides "-Os"))
+              ;; An empty answer removes the overrides.
+              (let ((current-prefix-arg '(4)))
+                (rmsbolt-test--with-read-string ""
+                  (call-interactively #'rmsbolt-compile)))
+              (should (equal cmd "gcc -O2 -S rmsbolt.c -o rmsbolt.s"))
+              (should-not rmsbolt-compile-arg-overrides))))
+      (kill-buffer src-buffer)
+      (delete-directory temp-dir t))))
 ;;;; Cargo integration tests
 
 (ert-deftest cargo-extract-and-clean-cmd-test ()
