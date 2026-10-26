@@ -297,8 +297,16 @@ stored out of order to exercise sorting."
   (should-not (rmsbolt--header-compiler-name nil)))
 
 (defconst rmsbolt-test--header-specs
-  '(("-O" . 0) ("-march" . 1) ("-mtune" . 1) ("-std=" . 0) ("-flto" . 0)
-    ("-target" . 1) ("-C" . 1))
+  '(("^-O" . nil)
+    ("^-march$" . "^[^-]")
+    ("^-march" . nil)
+    ("^-mtune" . nil)
+    ("^-std=" . nil)
+    ("^-flto" . nil)
+    ("^-target$" . "^[^-]")
+    ("^-target" . nil)
+    ("^-C$" . "^\\(opt-level\\|target-cpu\\|target-feature\\|lto\\)")
+    ("^-C\\(opt-level\\|target-cpu\\|target-feature\\|lto\\)" . nil))
   "Argument specs shared by the output header tests.")
 
 (ert-deftest output-header-args-test ()
@@ -312,22 +320,23 @@ stored out of order to exercise sorting."
                  "-O3 -march native -std=c++20"))
   (should (equal (rmsbolt--header-args
                   (concat "rustc --crate-name foo src/lib.rs"
-                          " -C opt-level=3 -C target-cpu=native")
+                          " -C opt-level=3 -C target-cpu=native"
+                          " -C embed-bitcode=no -C debuginfo=2")
                   rmsbolt-test--header-specs)
                  "-C opt-level=3 -C target-cpu=native"))
   (should (equal (rmsbolt--header-args
                   "rustc -Copt-level=2 -Cdebuginfo=0"
                   rmsbolt-test--header-specs)
-                 "-Copt-level=2 -Cdebuginfo=0"))
+                 "-Copt-level=2"))
   (should (equal (rmsbolt--header-args
                   "gcc -flto=thin -flto -target x86_64-linux"
                   rmsbolt-test--header-specs)
                  "-flto=thin -flto -target x86_64-linux"))
   (should (equal (rmsbolt--header-args
-                  "zig build-obj -O ReleaseFast"
-                  '(("-O" . 1)))
-                 "-O ReleaseFast"))
-  ;; A value flag without a value must not swallow the next flag.
+                  "gcc -march native -march=x86-64"
+                  rmsbolt-test--header-specs)
+                 "-march native -march=x86-64"))
+  ;; A value flag without a matching value must not swallow the next flag.
   (should (equal (rmsbolt--header-args
                   "gcc -march -O2"
                   rmsbolt-test--header-specs)
@@ -338,6 +347,25 @@ stored out of order to exercise sorting."
                  ""))
   (should (equal (rmsbolt--header-args "" rmsbolt-test--header-specs) "")))
 
+(ert-deftest output-header-args-regexp-pairs-test ()
+  "Cover the LEADING and FOLLOW regexp pair semantics."
+  (let ((specs '(("^-C$" . "^opt-level=.*")
+                 ("^-flto$" . nil)
+                 ("^-std=.*$" . nil))))
+    ;; A matching follow argument is kept as the value.
+    (should (equal (rmsbolt--header-args "rustc -C opt-level=1 src.rs" specs)
+                   "-C opt-level=1"))
+    ;; A non-matching follow argument drops both arguments.
+    (should (equal (rmsbolt--header-args
+                    "rustc -C embed-bitcode=no src.rs" specs)
+                   ""))
+    ;; An anchored leading regexp matches the exact argument only.
+    (should (equal (rmsbolt--header-args "gcc -flto" specs) "-flto"))
+    (should (equal (rmsbolt--header-args "gcc -flto=thin" specs) ""))
+    ;; An argument with an attached value matches its own regexp.
+    (should (equal (rmsbolt--header-args "gcc -std=c++17" specs)
+                   "-std=c++17"))))
+
 (ert-deftest output-header-arg-specs-test ()
   (with-temp-buffer
     (setq major-mode 'c-mode)
@@ -345,23 +373,29 @@ stored out of order to exercise sorting."
                    (cdr (assq t rmsbolt-output-header-arg-alist))))
     (setq major-mode 'rust-mode)
     (should (equal (rmsbolt--header-arg-specs (current-buffer))
-                   '(("-O" . 0) ("-C" . 1))))
+                   (cdr (assq 'rust-mode rmsbolt-output-header-arg-alist))))
+    (should (equal (rmsbolt--header-args
+                    "rustc -C opt-level=2 -C debuginfo=2 src.rs"
+                    (rmsbolt--header-arg-specs (current-buffer)))
+                   "-C opt-level=2"))
     ;; Tree-sitter modes fall back to their non-tree-sitter entry.
     (setq major-mode 'rust-ts-mode)
     (should (equal (rmsbolt--header-arg-specs (current-buffer))
-                   '(("-O" . 0) ("-C" . 1))))
+                   (cdr (assq 'rust-mode rmsbolt-output-header-arg-alist))))
     (setq major-mode 'zig-mode)
-    (should (equal (rmsbolt--header-arg-specs (current-buffer))
-                   '(("-O" . 1) ("-mcpu" . 1) ("-target" . 1))))
+    (should (equal (rmsbolt--header-args
+                    "zig build-obj -O ReleaseFast -mcpu=baseline"
+                    (rmsbolt--header-arg-specs (current-buffer)))
+                   "-O ReleaseFast -mcpu=baseline"))
     (setq major-mode 'some-unknown-mode)
     (should (equal (rmsbolt--header-arg-specs (current-buffer))
                    (cdr (assq t rmsbolt-output-header-arg-alist)))))
   (let ((rmsbolt-output-header-arg-alist
-         '((t ("-O" . 0)) (c-mode ("-f" . 0)))))
+         '((t ("^-O" . nil)) (c-mode ("^-f" . nil)))))
     (with-temp-buffer
       (setq major-mode 'c-mode)
       (should (equal (rmsbolt--header-arg-specs (current-buffer))
-                     '(("-f" . 0)))))))
+                     '(("^-f" . nil)))))))
 
 (ert-deftest output-header-line-test ()
   (should (equal (rmsbolt--output-header-line
@@ -376,7 +410,7 @@ stored out of order to exercise sorting."
   (should-not (rmsbolt--output-header-line "" rmsbolt-test--header-specs)))
 
 (ert-deftest output-header-custom-args-test ()
-  (let ((rmsbolt-output-header-arg-alist '((t ("-f" . 0)))))
+  (let ((rmsbolt-output-header-arg-alist '((t ("^-f" . nil)))))
     (with-temp-buffer
       (should (equal (rmsbolt--output-header-line
                       "gcc -O2 -fno-exceptions"

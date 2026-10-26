@@ -118,27 +118,53 @@ assembly and its interesting arguments, such as optimization levels."
   :group 'rmsbolt)
 
 (defcustom rmsbolt-output-header-arg-alist
-  '((t ("-O" . 0)
-        ("-march" . 1)
-        ("-mtune" . 1)
-        ("-mcpu" . 1)
-        ("-mcmodel" . 1)
-        ("-std=" . 0)
-        ("-flto" . 0)
-        ("-target" . 1)
-        ("--target=" . 0))
-    (rust-mode ("-O" . 0) ("-C" . 1))
-    (rustic-mode ("-O" . 0) ("-C" . 1))
-    (zig-mode ("-O" . 1) ("-mcpu" . 1) ("-target" . 1)))
+  '((t
+     ("^-O" . nil)
+     ("^-march$" . "^[^-]")
+     ("^-march" . nil)
+     ("^-mtune$" . "^[^-]")
+     ("^-mtune" . nil)
+     ("^-mcpu$" . "^[^-]")
+     ("^-mcpu" . nil)
+     ("^-mcmodel$" . "^[^-]")
+     ("^-mcmodel" . nil)
+     ("^-std=" . nil)
+     ("^-flto" . nil)
+     ("^-target$" . "^[^-]")
+     ("^-target" . nil)
+     ("^--target=" . nil))
+    (rust-mode
+     ("^-O" . nil)
+     ("^-C$" . "^\\(opt-level\\|target-cpu\\|target-feature\\|lto\\)")
+     ("^-C\\(opt-level\\|target-cpu\\|target-feature\\|lto\\)" . nil))
+    (rustic-mode
+     ("^-O" . nil)
+     ("^-C$" . "^\\(opt-level\\|target-cpu\\|target-feature\\|lto\\)")
+     ("^-C\\(opt-level\\|target-cpu\\|target-feature\\|lto\\)" . nil))
+    (zig-mode
+     ("^-O$" . "^\\(Debug\\|ReleaseSafe\\|ReleaseFast\\|ReleaseSmall\\)$")
+     ("^-O" . nil)
+     ("^-mcpu$" . "^[^-]")
+     ("^-mcpu" . nil)
+     ("^-target$" . "^[^-]")
+     ("^-target" . nil)))
   "Compiler arguments to show in the output buffer header.
 Keys are major mode symbols and `t' is the default for modes without an
-entry.  Each value is a list of (ARG . COUNT) pairs: ARG is the start of
-an argument and COUNT is the number of arguments that follow it, as in
-(\"-march\" . 1) for \"-march native\".  A COUNT of 0 also matches
-arguments that continue ARG, so (\"-O\" . 0) matches \"-O2\" and
-(\"-march\" . 0) matches \"-march=native\"."
+entry.  Each value is a list of (LEADING . FOLLOW) regexp pairs.  LEADING
+is matched against an argument and FOLLOW, when non-nil, is matched
+against the argument after it, which is then shown as its value.  For
+example:
+
+  (\"^-C$\" . \"^opt-level=.*\") ; -C opt-level=2, not -C debuginfo=2
+  (\"^-flto$\" . nil)            ; -flto, not -flto=thin
+  (\"^-std=.*$\" . nil)          ; -std=c++17
+
+The first pair whose LEADING matches wins.  When FOLLOW does not match,
+the remaining pairs are tried for the same argument."
   :type '(alist :key-type symbol
-                :value-type (repeat (cons string integer)))
+                :value-type (repeat (cons regexp
+                                          (choice (const :tag "None" nil)
+                                                  regexp))))
   :group 'rmsbolt)
 
 (defcustom rmsbolt-mode-lighter " RMSB"
@@ -2169,33 +2195,40 @@ the default entry."
         (cdr (assq base-mode rmsbolt-output-header-arg-alist))
         (cdr (assq t rmsbolt-output-header-arg-alist)))))
 
+(defun rmsbolt--header-arg-match-p (regexp token)
+  "Return non-nil if REGEXP matches TOKEN, ignoring case folding."
+  (let ((case-fold-search nil))
+    (string-match-p regexp token)))
+
 (defun rmsbolt--header-args (command specs)
   "Return the interesting arguments from COMMAND as a string.
-SPECS is a list of (ARG . COUNT) pairs, as in
+SPECS is a list of (LEADING . FOLLOW) regexp pairs, as in
 `rmsbolt-output-header-arg-alist'."
   (let ((tokens (rmsbolt-split--tokenize command))
         args)
     (while tokens
-      (let* ((token (pop tokens))
-             (spec (cl-find-if (lambda (spec)
-                                 (string-prefix-p (car spec) token))
-                               specs)))
-        (when spec
-          (push token args)
-          (let ((remaining (if (string= token (car spec))
-                               (cdr spec)
-                             0)))
-            (while (and (> remaining 0)
-                        tokens
-                        (not (string-prefix-p "-" (car tokens))))
-              (push (pop tokens) args)
-              (setq remaining (1- remaining)))))))
+      (let ((token (pop tokens))
+            (remaining specs)
+            arg)
+        (while (and remaining (not arg))
+          (let ((leading (caar remaining))
+                (follow (cdar remaining)))
+            (when (rmsbolt--header-arg-match-p leading token)
+              (cond
+               ((null follow)
+                (setq arg token))
+               ((and tokens
+                     (rmsbolt--header-arg-match-p follow (car tokens)))
+                (setq arg (concat token " " (pop tokens)))))))
+          (setq remaining (cdr remaining)))
+        (when arg
+          (push arg args))))
     (mapconcat #'identity (nreverse args) " ")))
 
 (defun rmsbolt--output-header-line (command specs)
   "Return the header comment line for COMMAND using SPECS.
-SPECS is a list of (ARG . COUNT) pairs.  Return nil if COMMAND has no
-compiler."
+SPECS is a list of (LEADING . FOLLOW) regexp pairs.  Return nil if
+COMMAND has no compiler."
   (let ((compiler (and command (rmsbolt--header-compiler-name command))))
     (when compiler
       (string-trim-right

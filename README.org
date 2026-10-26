@@ -104,21 +104,21 @@ shows its interesting arguments, for example:
 #+END_SRC
 
 Set ~rmsbolt-output-header~ to nil to omit the header.  The arguments are
-chosen by ~rmsbolt-output-header-arg-alist~, which maps major modes to a list
-of arguments.  Each entry is a pair of the argument and the number of
-arguments that follow it, for example:
+chosen by ~rmsbolt-output-header-arg-alist~, which maps major modes to lists
+of regexp pairs.  The first regexp matches an argument; when the second regexp
+matches the argument after it, the two are shown together, for example:
 
 #+BEGIN_SRC elisp
   (setq rmsbolt-output-header-arg-alist
-        '((c-mode ("-O" . 0) ("-march" . 1) ("-flto" . 0))
-          (rust-mode ("-O" . 0) ("-C" . 1))
-          (t ("-O" . 0))))
+        '((c-mode ("^-O" . nil) ("^-march$" . "^[^-]") ("^-march" . nil))
+          (rust-mode ("^-C$" . "^opt-level=.*") ("^-flto$" . nil))
+          (t ("^-O" . nil))))
 #+END_SRC
 
-An argument with a count of 0 also matches arguments that continue it, so
-~("-O" . 0)~ matches both ~-O2~ and ~-O~.  The ~t~ entry is the default for
-major modes without an entry.  After each compile, the output buffer is
-read-only and ~view-mode~ is enabled.
+~("^-march$" . "^[^-]")~ matches ~-march native~, ~("^-march" . nil)~ matches
+~-march=native~, and ~("^-flto$" . nil)~ matches ~-flto~ but not ~-flto=thin~.
+The ~t~ entry is the default for major modes without an entry.  After each
+compile, the output buffer is read-only and ~view-mode~ is enabled.
 
 The main knobs are described in the full documentation.
 
