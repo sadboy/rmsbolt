@@ -322,6 +322,11 @@ may not be cleared to default as variables are usually."
   "Time in seconds to delay before recompiling if there is a change.")
 (defvar rmsbolt--automated-compile nil
   "Whether this compile was automated or not.")
+
+(defvar-local rmsbolt-compile-arg-overrides nil
+  "Compiler arguments that override the ones in `rmsbolt-command'.
+`rmsbolt-compile' sets this when it is given argument overrides, and the
+value stays in effect for the buffer until it is set again.")
 (defvar rmsbolt--shell "bash"
   "Which shell to prefer if available.
 Used to work around inconsistencies in alternative shells.")
@@ -2200,43 +2205,57 @@ the default entry."
   (let ((case-fold-search nil))
     (string-match-p regexp token)))
 
-(defun rmsbolt--header-args (command specs)
-  "Return the interesting arguments from COMMAND as a string.
+(defun rmsbolt--header-arg-scan (command specs)
+  "Classify the arguments of COMMAND against SPECS.
 SPECS is a list of (LEADING . FOLLOW) regexp pairs, as in
-`rmsbolt-output-header-arg-alist'."
-  (let ((tokens (rmsbolt-split--tokenize command))
-        args)
+`rmsbolt-output-header-arg-alist'.  Return a list of two elements, the
+arguments of COMMAND that match SPECS and the arguments that match no
+spec.  A matching argument is a string with its value appended when
+FOLLOW matched the argument after it."
+  (let ((tokens (and command (rmsbolt-split--tokenize command)))
+        args ignored)
     (while tokens
       (let ((token (pop tokens))
             (remaining specs)
-            arg)
-        (while (and remaining (not arg))
+            match)
+        (while (and remaining (not match))
           (let ((leading (caar remaining))
                 (follow (cdar remaining)))
             (when (rmsbolt--header-arg-match-p leading token)
               (cond
                ((null follow)
-                (setq arg token))
+                (setq match token))
                ((and tokens
                      (rmsbolt--header-arg-match-p follow (car tokens)))
-                (setq arg (concat token " " (pop tokens)))))))
+                (setq match (concat token " " (pop tokens)))))))
           (setq remaining (cdr remaining)))
-        (when arg
-          (push arg args))))
-    (mapconcat #'identity (nreverse args) " ")))
+        (if match
+            (push match args)
+          (push token ignored))))
+    (list (nreverse args) (nreverse ignored))))
 
-(defun rmsbolt--output-header-line (command specs)
+(defun rmsbolt--header-args (command specs &optional overrides)
+  "Return the interesting arguments from COMMAND as a string.
+SPECS is a list of (LEADING . FOLLOW) regexp pairs, as in
+`rmsbolt-output-header-arg-alist'.  OVERRIDES, when non-nil, is a
+string of arguments that are appended to the arguments of COMMAND."
+  (mapconcat #'identity
+             (append (car (rmsbolt--header-arg-scan command specs))
+                     (car (rmsbolt--header-arg-scan overrides specs)))
+             " "))
+
+(defun rmsbolt--output-header-line (command specs &optional overrides)
   "Return the header comment line for COMMAND using SPECS.
-SPECS is a list of (LEADING . FOLLOW) regexp pairs.  Return nil if
-COMMAND has no compiler."
+SPECS is a list of (LEADING . FOLLOW) regexp pairs.  OVERRIDES, when
+non-nil, is a string of arguments that take precedence over the ones in
+COMMAND.  Return nil if COMMAND has no compiler."
   (let ((compiler (and command (rmsbolt--header-compiler-name command))))
     (when compiler
       (string-trim-right
        (string-join
         (list ";; compiled with:" compiler
-              (rmsbolt--header-args command specs))
+              (rmsbolt--header-args command specs overrides))
         " ")))))
-
 (defun rmsbolt--shift-line-mapping (src-buffer lines)
   "Move the assembly line numbers in SRC-BUFFER's mapping down by LINES."
   (with-current-buffer src-buffer
@@ -2260,7 +2279,9 @@ lines.  Do nothing if `rmsbolt-output-header' is nil."
   (let ((header (and rmsbolt-output-header
                      (rmsbolt--output-header-line
                       (buffer-local-value 'rmsbolt-command src-buffer)
-                      (rmsbolt--header-arg-specs src-buffer)))))
+                      (rmsbolt--header-arg-specs src-buffer)
+                      (buffer-local-value 'rmsbolt-compile-arg-overrides
+                                          src-buffer)))))
     (when header
       (let ((inhibit-read-only t)
             (inhibit-modification-hooks t))
@@ -2417,9 +2438,46 @@ Are you running two compilations at the same time?"))
     existing-cmd))
 
 ;;;;; UI Functions
-(defun rmsbolt-compile ()
-  "Compile the current rmsbolt buffer."
-  (interactive)
+(defun rmsbolt--read-compile-arg-overrides ()
+  "Read compiler argument overrides for `rmsbolt-compile'.
+Only arguments that match `rmsbolt-output-header-arg-alist' for the
+mode of the current buffer are accepted."
+  (let* ((scan (rmsbolt--header-arg-scan
+                (read-string "Compile args (this compilation only): ")
+                (rmsbolt--header-arg-specs (current-buffer))))
+         (ignored (cadr scan)))
+    (when ignored
+      (user-error "Only interesting compile args are allowed, not: %s"
+                  (string-join ignored " ")))
+    (mapconcat #'identity (car scan) " ")))
+
+(defun rmsbolt--apply-arg-overrides (command overrides)
+  "Return COMMAND with OVERRIDES added to the compiler invocation.
+OVERRIDES are inserted before any command that is chained to the
+compiler invocation with `&&', so that chained commands do not receive
+them.  Compilers give later arguments precedence, so the appended
+arguments override the ones already in COMMAND."
+  (if (or (null overrides) (string-empty-p overrides))
+      command
+    (let ((chained (string-match (rx " && ") command)))
+      (if chained
+          (concat (substring command 0 chained) " " overrides
+                  (substring command chained))
+        (concat command " " overrides)))))
+
+(defun rmsbolt-compile (&optional arg-overrides)
+  "Compile the current rmsbolt buffer.
+
+When ARG-OVERRIDES is non-nil, it is a string of space separated
+compiler arguments that override the ones in `rmsbolt-command'.  They
+stay in effect for the buffer until they are set again, and an empty
+string removes them.  Only arguments that match
+`rmsbolt-output-header-arg-alist' for the language of the current buffer
+are accepted, and they are shown in the output buffer header.
+Interactively, use a prefix argument to be prompted for the arguments."
+  (interactive
+   (list (when current-prefix-arg
+           (rmsbolt--read-compile-arg-overrides))))
   ;; perhaps use `save-some-buffers'?
   (when (and (buffer-modified-p)
              (yes-or-no-p (format "Save buffer %s? " (buffer-name))))
@@ -2427,6 +2485,9 @@ Are you running two compilations at the same time?"))
   (rmsbolt--gen-temp)
   ;; Current buffer = src-buffer at this point
   (setq rmsbolt-src-buffer (current-buffer))
+  (when arg-overrides
+    (setq-local rmsbolt-compile-arg-overrides
+                (unless (string-empty-p arg-overrides) arg-overrides)))
   (cond
    ((derived-mode-p 'asm-mode)
     ;; We cannot compile asm-mode files
@@ -2448,6 +2509,8 @@ Are you running two compilations at the same time?"))
             ;; currently - this works around that.
             (with-current-buffer (or (buffer-base-buffer) (current-buffer))
               (funcall func :src-buffer src-buffer)))
+           (cmd (rmsbolt--apply-arg-overrides
+                 cmd rmsbolt-compile-arg-overrides))
            (asm-format
             (buffer-local-value 'rmsbolt-asm-format src-buffer))
            ;; Directory where we generate files, while respecting a buffer's

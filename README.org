@@ -120,6 +120,13 @@ matches the argument after it, the two are shown together, for example:
 The ~t~ entry is the default for major modes without an entry.  After each
 compile, the output buffer is read-only and ~view-mode~ is enabled.
 
+To try other arguments without editing the file, give ~rmsbolt-compile~ a
+prefix argument (~C-u C-c C-c~) and type the arguments, for example
+~-O3 -march=native~.  They stay in effect for that buffer until you set
+them again, and they are shown in the header.  Give an empty answer to
+remove them.  Only arguments that match ~rmsbolt-output-header-arg-alist~
+are accepted; any other argument aborts the command.
+
 The main knobs are described in the full documentation.
 
 * Demos
