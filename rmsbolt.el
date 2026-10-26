@@ -54,6 +54,8 @@
 ;; `rmsbolt-filter-*': Tweak filtering of binary output.
 ;; `rmsbolt-asm-format': Choose between intel att, and other syntax if supported.
 ;; `rmsbolt-demangle': Demangle the output, if supported.
+;; `rmsbolt-output-header': Show the compiler and its interesting arguments
+;; at the top of the output buffer.
 ;;
 ;; For more advanced configuration (to the point where you can override almost
 ;; all of RMSbolt yourself), you can set `rmsbolt-language-descriptor' with a
@@ -87,6 +89,7 @@
 (require 'compile)
 (require 'disass)
 (require 'json)
+(require 'view)
 
 (require 'rmsbolt-java)
 (require 'rmsbolt-split)
@@ -104,6 +107,38 @@
 (defcustom rmsbolt-goto-match t
   "Whether we should goto the match in the other buffer if it is non visible."
   :type 'boolean
+  :group 'rmsbolt)
+
+(defcustom rmsbolt-output-header t
+  "Whether to insert a compiler header into the output buffer.
+The header is a single comment line with the compiler that produced the
+assembly and its interesting arguments, such as optimization levels."
+  :type 'boolean
+  :safe 'booleanp
+  :group 'rmsbolt)
+
+(defcustom rmsbolt-output-header-arg-alist
+  '((t ("-O" . 0)
+        ("-march" . 1)
+        ("-mtune" . 1)
+        ("-mcpu" . 1)
+        ("-mcmodel" . 1)
+        ("-std=" . 0)
+        ("-flto" . 0)
+        ("-target" . 1)
+        ("--target=" . 0))
+    (rust-mode ("-O" . 0) ("-C" . 1))
+    (rustic-mode ("-O" . 0) ("-C" . 1))
+    (zig-mode ("-O" . 1) ("-mcpu" . 1) ("-target" . 1)))
+  "Compiler arguments to show in the output buffer header.
+Keys are major mode symbols and `t' is the default for modes without an
+entry.  Each value is a list of (ARG . COUNT) pairs: ARG is the start of
+an argument and COUNT is the number of arguments that follow it, as in
+(\"-march\" . 1) for \"-march native\".  A COUNT of 0 also matches
+arguments that continue ARG, so (\"-O\" . 0) matches \"-O2\" and
+(\"-march\" . 0) matches \"-march=native\"."
+  :type '(alist :key-type symbol
+                :value-type (repeat (cons string integer)))
   :group 'rmsbolt)
 
 (defcustom rmsbolt-mode-lighter " RMSB"
@@ -2107,6 +2142,108 @@ Tuned to Elfutils's implementation of readelf"
     (setq result (nconc die result))
     (nreverse result)))
 
+(defconst rmsbolt--header-wrappers '("env" "ccache" "sccache" "distcc")
+  "Command prefixes that hide the compiler in a compile command.")
+
+(defun rmsbolt--header-compiler-name (command)
+  "Return the compiler executable name from COMMAND, or nil."
+  (let ((tokens (and command (rmsbolt-split--tokenize command))))
+    ;; Skip wrappers and environment assignments, such as those Cargo adds.
+    (while (and tokens
+                (or (member (car tokens) rmsbolt--header-wrappers)
+                    (string-match-p (rx bos (1+ (any "A-Za-z0-9_")) "=")
+                                    (car tokens))))
+      (setq tokens (cdr tokens)))
+    (when tokens
+      (string-trim (file-name-nondirectory (car tokens)) "[\"']" "[\"']"))))
+
+(defun rmsbolt--header-arg-specs (src-buffer)
+  "Return the header argument specs for SRC-BUFFER.
+Look up the major mode of SRC-BUFFER in
+`rmsbolt-output-header-arg-alist', then its tree-sitter equivalent, then
+the default entry."
+  (let* ((mode (buffer-local-value 'major-mode src-buffer))
+         (base-mode (intern (replace-regexp-in-string
+                             "ts-mode$" "mode" (symbol-name mode)))))
+    (or (cdr (assq mode rmsbolt-output-header-arg-alist))
+        (cdr (assq base-mode rmsbolt-output-header-arg-alist))
+        (cdr (assq t rmsbolt-output-header-arg-alist)))))
+
+(defun rmsbolt--header-args (command specs)
+  "Return the interesting arguments from COMMAND as a string.
+SPECS is a list of (ARG . COUNT) pairs, as in
+`rmsbolt-output-header-arg-alist'."
+  (let ((tokens (rmsbolt-split--tokenize command))
+        args)
+    (while tokens
+      (let* ((token (pop tokens))
+             (spec (cl-find-if (lambda (spec)
+                                 (string-prefix-p (car spec) token))
+                               specs)))
+        (when spec
+          (push token args)
+          (let ((remaining (if (string= token (car spec))
+                               (cdr spec)
+                             0)))
+            (while (and (> remaining 0)
+                        tokens
+                        (not (string-prefix-p "-" (car tokens))))
+              (push (pop tokens) args)
+              (setq remaining (1- remaining)))))))
+    (mapconcat #'identity (nreverse args) " ")))
+
+(defun rmsbolt--output-header-line (command specs)
+  "Return the header comment line for COMMAND using SPECS.
+SPECS is a list of (ARG . COUNT) pairs.  Return nil if COMMAND has no
+compiler."
+  (let ((compiler (and command (rmsbolt--header-compiler-name command))))
+    (when compiler
+      (string-trim-right
+       (string-join
+        (list ";; compiled with:" compiler
+              (rmsbolt--header-args command specs))
+        " ")))))
+
+(defun rmsbolt--shift-line-mapping (src-buffer lines)
+  "Move the assembly line numbers in SRC-BUFFER's mapping down by LINES."
+  (with-current-buffer src-buffer
+    (when rmsbolt-line-mapping
+      (let (entries)
+        (maphash (lambda (src-line chunks)
+                   (push (cons src-line chunks) entries))
+                 rmsbolt-line-mapping)
+        (dolist (entry entries)
+          (puthash (car entry)
+                   (mapcar (lambda (chunk)
+                             (cons (+ (car chunk) lines)
+                                   (+ (cdr chunk) lines)))
+                           (cdr entry))
+                   rmsbolt-line-mapping))))))
+
+(defun rmsbolt--insert-output-header (src-buffer)
+  "Insert a compiler header into the current output buffer.
+Shift `rmsbolt-line-mapping' in SRC-BUFFER by the number of inserted
+lines.  Do nothing if `rmsbolt-output-header' is nil."
+  (let ((header (and rmsbolt-output-header
+                     (rmsbolt--output-header-line
+                      (buffer-local-value 'rmsbolt-command src-buffer)
+                      (rmsbolt--header-arg-specs src-buffer)))))
+    (when header
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t))
+        (save-excursion
+          (goto-char (point-min))
+          (insert header "\n")))
+      (rmsbolt--shift-line-mapping src-buffer 1))))
+
+(defun rmsbolt--finalize-output-buffer (src-buffer)
+  "Finish populating the output buffer for SRC-BUFFER.
+Insert the compiler header, then make the buffer read-only and enable
+`view-mode'."
+  (rmsbolt--insert-output-header src-buffer)
+  (read-only-mode 1)
+  (view-mode 1))
+
 ;;;;; HANDLERS
 (cl-defun rmsbolt--handle-finish-compile (buffer str &key override-buffer stopped)
   "Finish hook for compilations.
@@ -2148,6 +2285,7 @@ Argument STOPPED The compilation was stopped to start another compilation."
                      (insert-file-contents (rmsbolt-output-filename src-buffer t)))
                    (save-excursion
                      (rmsbolt--process-asm-lines src-buffer)))
+                   (rmsbolt--finalize-output-buffer src-buffer)
                  (when window
                    (set-window-start window old-window-start)
                    (set-window-point window old-point))

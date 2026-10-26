@@ -284,6 +284,210 @@ stored out of order to exercise sorting."
       (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
       (should-error (rmsbolt-output-backward-chunk) :type 'user-error))))
 
+;;;; Output header tests
+
+(ert-deftest output-header-compiler-name-test ()
+  (should (equal (rmsbolt--header-compiler-name "gcc -O2") "gcc"))
+  (should (equal (rmsbolt--header-compiler-name "/usr/bin/clang++ -O3") "clang++"))
+  (should (equal (rmsbolt--header-compiler-name "ccache gcc -O2") "gcc"))
+  (should (equal (rmsbolt--header-compiler-name
+                  "env CARGO=/usr/bin/cargo rustc --crate-name foo src/lib.rs")
+                 "rustc"))
+  (should-not (rmsbolt--header-compiler-name ""))
+  (should-not (rmsbolt--header-compiler-name nil)))
+
+(defconst rmsbolt-test--header-specs
+  '(("-O" . 0) ("-march" . 1) ("-mtune" . 1) ("-std=" . 0) ("-flto" . 0)
+    ("-target" . 1) ("-C" . 1))
+  "Argument specs shared by the output header tests.")
+
+(ert-deftest output-header-args-test ()
+  (should (equal (rmsbolt--header-args
+                  "gcc -O2 -march=native -Wall -I/usr/include -o out.s src.c"
+                  rmsbolt-test--header-specs)
+                 "-O2 -march=native"))
+  (should (equal (rmsbolt--header-args
+                  "clang++ -O3 -march native -std=c++20"
+                  rmsbolt-test--header-specs)
+                 "-O3 -march native -std=c++20"))
+  (should (equal (rmsbolt--header-args
+                  (concat "rustc --crate-name foo src/lib.rs"
+                          " -C opt-level=3 -C target-cpu=native")
+                  rmsbolt-test--header-specs)
+                 "-C opt-level=3 -C target-cpu=native"))
+  (should (equal (rmsbolt--header-args
+                  "rustc -Copt-level=2 -Cdebuginfo=0"
+                  rmsbolt-test--header-specs)
+                 "-Copt-level=2 -Cdebuginfo=0"))
+  (should (equal (rmsbolt--header-args
+                  "gcc -flto=thin -flto -target x86_64-linux"
+                  rmsbolt-test--header-specs)
+                 "-flto=thin -flto -target x86_64-linux"))
+  (should (equal (rmsbolt--header-args
+                  "zig build-obj -O ReleaseFast"
+                  '(("-O" . 1)))
+                 "-O ReleaseFast"))
+  ;; A value flag without a value must not swallow the next flag.
+  (should (equal (rmsbolt--header-args
+                  "gcc -march -O2"
+                  rmsbolt-test--header-specs)
+                 "-march -O2"))
+  (should (equal (rmsbolt--header-args
+                  "gcc -Wall -Wextra -o out.s"
+                  rmsbolt-test--header-specs)
+                 ""))
+  (should (equal (rmsbolt--header-args "" rmsbolt-test--header-specs) "")))
+
+(ert-deftest output-header-arg-specs-test ()
+  (with-temp-buffer
+    (setq major-mode 'c-mode)
+    (should (equal (rmsbolt--header-arg-specs (current-buffer))
+                   (cdr (assq t rmsbolt-output-header-arg-alist))))
+    (setq major-mode 'rust-mode)
+    (should (equal (rmsbolt--header-arg-specs (current-buffer))
+                   '(("-O" . 0) ("-C" . 1))))
+    ;; Tree-sitter modes fall back to their non-tree-sitter entry.
+    (setq major-mode 'rust-ts-mode)
+    (should (equal (rmsbolt--header-arg-specs (current-buffer))
+                   '(("-O" . 0) ("-C" . 1))))
+    (setq major-mode 'zig-mode)
+    (should (equal (rmsbolt--header-arg-specs (current-buffer))
+                   '(("-O" . 1) ("-mcpu" . 1) ("-target" . 1))))
+    (setq major-mode 'some-unknown-mode)
+    (should (equal (rmsbolt--header-arg-specs (current-buffer))
+                   (cdr (assq t rmsbolt-output-header-arg-alist)))))
+  (let ((rmsbolt-output-header-arg-alist
+         '((t ("-O" . 0)) (c-mode ("-f" . 0)))))
+    (with-temp-buffer
+      (setq major-mode 'c-mode)
+      (should (equal (rmsbolt--header-arg-specs (current-buffer))
+                     '(("-f" . 0)))))))
+
+(ert-deftest output-header-line-test ()
+  (should (equal (rmsbolt--output-header-line
+                  "gcc -O2 -march=native -o out.s src.c"
+                  rmsbolt-test--header-specs)
+                 ";; compiled with: gcc -O2 -march=native"))
+  (should (equal (rmsbolt--output-header-line
+                  "rustc -C opt-level=3"
+                  rmsbolt-test--header-specs)
+                 ";; compiled with: rustc -C opt-level=3"))
+  (should-not (rmsbolt--output-header-line nil rmsbolt-test--header-specs))
+  (should-not (rmsbolt--output-header-line "" rmsbolt-test--header-specs)))
+
+(ert-deftest output-header-custom-args-test ()
+  (let ((rmsbolt-output-header-arg-alist '((t ("-f" . 0)))))
+    (with-temp-buffer
+      (should (equal (rmsbolt--output-header-line
+                      "gcc -O2 -fno-exceptions"
+                      (rmsbolt--header-arg-specs (current-buffer)))
+                     ";; compiled with: gcc -fno-exceptions")))))
+
+(ert-deftest output-header-insert-shifts-mapping-test ()
+  (let ((src-buffer (generate-new-buffer " *rmsbolt-test-header-src*"))
+        (output-buffer (generate-new-buffer " *rmsbolt-test-header-output*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer src-buffer
+            (setq-local rmsbolt-command "clang -O3 -march=x86-64-v3")
+            (setq rmsbolt-line-mapping (make-hash-table :test #'eq))
+            (puthash 5 '((1 . 2) (6 . 7)) rmsbolt-line-mapping))
+          (with-current-buffer output-buffer
+            (asm-mode)
+            (insert "a\nb\nc\nd\ne\nf\ng\nh\n")
+            (rmsbolt--finalize-output-buffer src-buffer)
+            (should (equal (buffer-substring-no-properties
+                            (point-min) (point-max))
+                           (concat ";; compiled with: clang -O3 -march=x86-64-v3\n"
+                                   "a\nb\nc\nd\ne\nf\ng\nh\n")))
+            (should buffer-read-only)
+            (should view-mode))
+          (with-current-buffer src-buffer
+            (should (equal (gethash 5 rmsbolt-line-mapping)
+                           '((2 . 3) (7 . 8))))))
+      (kill-buffer src-buffer)
+      (kill-buffer output-buffer))))
+
+(ert-deftest output-header-disabled-test ()
+  (let ((src-buffer (generate-new-buffer " *rmsbolt-test-header-src*"))
+        (output-buffer (generate-new-buffer " *rmsbolt-test-header-output*"))
+        (rmsbolt-output-header nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer src-buffer
+            (setq-local rmsbolt-command "gcc -O2")
+            (setq rmsbolt-line-mapping (make-hash-table :test #'eq))
+            (puthash 5 '((1 . 2)) rmsbolt-line-mapping))
+          (with-current-buffer output-buffer
+            (asm-mode)
+            (insert "a\nb\n")
+            (rmsbolt--finalize-output-buffer src-buffer)
+            (should (equal (buffer-string) "a\nb\n"))
+            (should buffer-read-only)
+            (should view-mode))
+          (with-current-buffer src-buffer
+            (should (equal (gethash 5 rmsbolt-line-mapping) '((1 . 2))))))
+      (kill-buffer src-buffer)
+      (kill-buffer output-buffer))))
+
+(ert-deftest output-header-end-to-end-test ()
+  (let* ((temp-dir (make-temp-file "rmsbolt-header-test-" t))
+         (rmsbolt--temp-dir temp-dir)
+         (rmsbolt-output-buffer "*rmsbolt-test-header-output*")
+         (src-buffer (generate-new-buffer " *rmsbolt-test-header-src*"))
+         (compilation-buffer (generate-new-buffer " *rmsbolt-test-header-compile*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer src-buffer
+            (setq default-directory temp-dir)
+            (insert "int main(void) { return 0; }\n")
+            (setq-local rmsbolt-command "gcc -O2 -march=native")
+            (setq-local rmsbolt-language-descriptor
+                        (make-rmsbolt-lang :supports-asm t :supports-disass nil))
+            (setq-local rmsbolt-disassemble nil)
+            (setq-local rmsbolt-filter-directives nil)
+            (setq-local rmsbolt-filter-labels nil)
+            (setq-local rmsbolt-filter-comment-only nil))
+          (with-temp-file (expand-file-name "rmsbolt.s" temp-dir)
+            (insert "\t.text\n\t.globl\tmain\nmain:\n.LFB0:\n"
+                    "\t.loc 1 2 0\n\tpush\trbp\n"
+                    "\t.loc 1 3 0\n\tmov\teax, 1\n\tret\n"))
+          (with-current-buffer compilation-buffer
+            (setq default-directory temp-dir)
+            (setq rmsbolt-src-buffer src-buffer))
+          (cl-letf (((symbol-function 'rmsbolt-mode) #'ignore)
+                    ((symbol-function 'display-buffer) #'ignore)
+                    ((symbol-function 'run-at-time) #'ignore))
+            (rmsbolt--handle-finish-compile compilation-buffer nil))
+          (let ((output-buffer (get-buffer rmsbolt-output-buffer)))
+            (should output-buffer)
+            (with-current-buffer output-buffer
+              (should (equal (buffer-substring-no-properties
+                              (point-min) (line-end-position))
+                             ";; compiled with: gcc -O2 -march=native"))
+              (should buffer-read-only)
+              (should view-mode))
+            ;; Each mapping chunk must still start on a line that carries its
+            ;; source line, which fails when the header is not accounted for.
+            (with-current-buffer src-buffer
+              (maphash
+               (lambda (src-line chunks)
+                 (dolist (chunk chunks)
+                   (with-current-buffer output-buffer
+                     (goto-char (point-min))
+                     (forward-line (1- (car chunk)))
+                     (should (= (get-text-property
+                                 (line-beginning-position) 'rmsbolt-src-line)
+                                src-line)))))
+               rmsbolt-line-mapping)
+              (should (equal (gethash 2 rmsbolt-line-mapping) '((7 . 7))))
+              (should (equal (gethash 3 rmsbolt-line-mapping) '((9 . 10)))))))
+      (kill-buffer src-buffer)
+      (when (get-buffer rmsbolt-output-buffer)
+        (kill-buffer (get-buffer rmsbolt-output-buffer)))
+      (kill-buffer compilation-buffer)
+      (delete-directory temp-dir t))))
+
 ;;;; Cargo integration tests
 
 (ert-deftest cargo-extract-and-clean-cmd-test ()
