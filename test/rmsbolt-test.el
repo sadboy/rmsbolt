@@ -7,6 +7,7 @@
 
 (require 'el-mock nil t)
 (require 'rmsbolt)
+(require 'rust-ts-mode nil t)
 
 (ert-deftest sanity-check-ert ()
   "Check if ERT is working. :)"
@@ -942,6 +943,381 @@ stored out of order to exercise sorting."
     (setq-local rmsbolt--default-variables '(rmsbolt-command))
     (should-not (rmsbolt--handle-c-compile-cmd (current-buffer)))
     (should (equal rmsbolt-default-directory "/tmp/custom-dir/"))))
+
+;;;; Cargo ASM tests
+
+(defun rmsbolt-test--rust-tree-sitter-available-p ()
+  "Return non-nil if Rust tree-sitter support is available."
+  (and (fboundp 'treesit-available-p)
+       (treesit-available-p)
+       (fboundp 'treesit-language-available-p)
+       (treesit-language-available-p 'rust)))
+
+(defun rmsbolt-test--rust-buffer (source &optional file)
+  "Return a temporary Rust SOURCE buffer with optional FILE."
+  (let ((buffer (generate-new-buffer " *rmsbolt-test-rust*")))
+    (with-current-buffer buffer
+      (insert source)
+      (when file
+        (setq buffer-file-name file))
+      (rust-ts-mode)
+      (rmsbolt--cargo-asm-ensure-parser))
+    buffer))
+
+(defmacro rmsbolt-test--with-rust-buffer (source &optional file &rest body)
+  "Run BODY in a Rust SOURCE buffer with optional FILE."
+  (declare (indent 2) (debug (form form &rest body)))
+  `(let ((buffer (rmsbolt-test--rust-buffer ,source ,file)))
+     (unwind-protect
+         (with-current-buffer buffer
+           ,@body)
+       (kill-buffer buffer))))
+
+(defun rmsbolt-test--rust-function-at (source marker &optional file)
+  "Return the parsed Rust function at MARKER in SOURCE with optional FILE."
+  (let ((buffer (rmsbolt-test--rust-buffer source file)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-min))
+          (search-forward marker)
+          (goto-char (match-beginning 0))
+          (rmsbolt--cargo-asm-function-at-point))
+      (kill-buffer buffer))))
+
+(defun rmsbolt-test--function-by-display (display functions)
+  "Return the function in FUNCTIONS with DISPLAY name."
+  (cl-find display functions
+           :key #'rmsbolt--cargo-asm-function-display-name
+           :test #'equal))
+
+(defconst rmsbolt-test--cargo-asm-rust-source
+  (concat
+   "pub mod sub {\n"
+   "    pub fn bar() {}\n"
+   "}\n"
+   "\n"
+   "struct Foo;\n"
+   "impl Foo {\n"
+   "    pub fn bar(&self) {}\n"
+   "}\n"
+   "\n"
+   "struct Wrapper<T>(T);\n"
+   "impl<T> Wrapper<T> {\n"
+   "    pub fn unwrap_val(&self) {}\n"
+   "}\n"
+   "impl Wrapper<i32> {\n"
+   "    pub fn concrete(&self) {}\n"
+   "}\n"
+   "\n"
+   "trait MyTrait { fn trait_fn(&self); }\n"
+   "impl MyTrait for Foo {\n"
+   "    fn trait_fn(&self) {}\n"
+   "}\n"
+   "\n"
+   "pub fn foo() {}\n"
+   "pub fn outer() {\n"
+   "    struct Local;\n"
+   "    enum E { A }\n"
+   "    fn inner() {}\n"
+   "    let _ = Local;\n"
+   "    let _ = E::A;\n"
+   "}\n")
+  "Rust source for cargo-asm function extraction tests.")
+
+(defconst rmsbolt-test--cargo-asm-items
+  '(((id . 0) (name . "demo::add"))
+    ((id . 1) (name . "demo::add_one"))
+    ((id . 2) (name . "demo::generic_add::<i32>"))
+    ((id . 3) (name . "demo::generic_add::<u8>"))
+    ((id . 4) (name . "demo::sub::bar"))
+    ((id . 5) (name . "<demo::Foo>::bar"))
+    ((id . 6) (name . "<demo::Wrapper<i32>>::unwrap_val"))
+    ((id . 7) (name . "<demo::Wrapper<u8>>::unwrap_val"))
+    ((id . 8) (name . "<demo::Wrapper<i32>>::concrete"))
+    ((id . 9) (name . "<demo::Foo as demo::MyTrait>::trait_fn")))
+  "Fake cargo-asm JSON items for matching tests.")
+
+(ert-deftest cargo-asm-keybinding-test ()
+  (should (eq (lookup-key rmsbolt-mode-map (kbd "C-c C-a"))
+              #'rmsbolt-cargo-asm)))
+
+(ert-deftest cargo-asm-function-extraction-test ()
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (rmsbolt-test--with-rust-buffer rmsbolt-test--cargo-asm-rust-source nil
+    (let ((functions (rmsbolt--cargo-asm-functions)))
+      (should (= (length functions) 8))
+      (should (rmsbolt-test--function-by-display "sub::bar" functions))
+      (should (rmsbolt-test--function-by-display "Foo::bar" functions))
+      (should (rmsbolt-test--function-by-display "Wrapper<T>::unwrap_val" functions))
+      (should (rmsbolt-test--function-by-display "Wrapper<i32>::concrete" functions))
+      (should (rmsbolt-test--function-by-display "<Foo as MyTrait>::trait_fn" functions))
+      (should (rmsbolt-test--function-by-display "foo" functions))
+      (should (rmsbolt-test--function-by-display "outer" functions))
+      (should (rmsbolt-test--function-by-display "outer::inner" functions))
+      (should-not (rmsbolt-test--function-by-display "Local" functions))
+      (should-not (rmsbolt-test--function-by-display "E" functions))
+      (should (equal (rmsbolt--cargo-asm-function-qualifiers
+                      (rmsbolt-test--function-by-display "Foo::bar" functions))
+                     '("Foo")))
+      (should (equal (rmsbolt--cargo-asm-function-qualifiers
+                      (rmsbolt-test--function-by-display
+                       "Wrapper<T>::unwrap_val" functions))
+                     '("Wrapper")))
+      (should (equal (rmsbolt--cargo-asm-function-qualifiers
+                      (rmsbolt-test--function-by-display
+                       "Wrapper<i32>::concrete" functions))
+                     '("Wrapper<i32>")))
+      (should (equal (rmsbolt--cargo-asm-function-qualifiers
+                      (rmsbolt-test--function-by-display
+                       "<Foo as MyTrait>::trait_fn" functions))
+                     '("Foo" "MyTrait")))
+      (goto-char (point-min))
+      (search-forward "struct Local")
+      (goto-char (match-beginning 0))
+      (should (equal (rmsbolt--cargo-asm-function-name
+                      (rmsbolt--cargo-asm-function-at-point))
+                     "outer"))
+      (goto-char (point-min))
+      (search-forward "fn inner")
+      (goto-char (match-beginning 0))
+      (should (equal (rmsbolt--cargo-asm-function-name
+                      (rmsbolt--cargo-asm-function-at-point))
+                     "inner")))))
+
+(ert-deftest cargo-asm-prompt-selection-test ()
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (rmsbolt-test--with-rust-buffer "pub fn foo() {}\npub fn bar() {}\n" nil
+    (let* ((functions (rmsbolt--cargo-asm-functions))
+           (selected (rmsbolt--cargo-asm--prompt
+                      (lambda (_prompt collection _predicate _require-match
+                               _initial _history default)
+                        (should (equal default "foo"))
+                        (should (member "bar" collection))
+                        "bar")
+                      functions (car functions))))
+      (should (equal (rmsbolt--cargo-asm-function-name selected) "bar")))))
+
+(ert-deftest cargo-asm-file-module-stem-test ()
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (rmsbolt-test--with-rust-buffer "pub fn bar() {}\n"
+      "/tmp/rmsbolt-cargo-asm-test/src/sub.rs"
+    (let* ((function (car (rmsbolt--cargo-asm-functions))))
+      (should (equal (rmsbolt--cargo-asm-function-display-name function)
+                     "sub::bar"))
+      (should (equal (rmsbolt--cargo-asm-function-modules function)
+                     '("sub"))))))
+
+(ert-deftest cargo-asm-nested-module-paths-test ()
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (rmsbolt-test--with-rust-buffer "pub fn bar() {}\n"
+      "/tmp/rmsbolt-cargo-asm-test/src/foo/mod.rs"
+    (let ((function (car (rmsbolt--cargo-asm-functions))))
+      (should (equal (rmsbolt--cargo-asm-function-display-name function)
+                     "foo::bar"))
+      (should (equal (rmsbolt--cargo-asm-function-modules function)
+                     '("foo")))))
+  (rmsbolt-test--with-rust-buffer "pub fn bar() {}\n"
+      "/tmp/rmsbolt-cargo-asm-test/src/foo/bar.rs"
+    (let ((function (car (rmsbolt--cargo-asm-functions))))
+      (should (equal (rmsbolt--cargo-asm-function-display-name function)
+                     "foo::bar::bar"))
+      (should (equal (rmsbolt--cargo-asm-function-modules function)
+                     '("foo" "bar")))))
+  (let ((my-bin "/tmp/rmsbolt-cargo-asm-test/src/bin/my_bin.rs"))
+    (rmsbolt-test--with-rust-buffer "pub fn bar() {}\n" my-bin
+      (let ((function (car (rmsbolt--cargo-asm-functions my-bin))))
+        (should (equal (rmsbolt--cargo-asm-function-display-name function)
+                       "bar"))
+        (should-not (rmsbolt--cargo-asm-function-modules function)))))
+  (let ((tool "/tmp/rmsbolt-cargo-asm-test/src/bin/tool.rs")
+        (helper "/tmp/rmsbolt-cargo-asm-test/src/bin/tool/helper.rs"))
+    (rmsbolt-test--with-rust-buffer "pub fn helper() {}\n" helper
+      (let ((function (car (rmsbolt--cargo-asm-functions tool))))
+        (should (equal (rmsbolt--cargo-asm-function-display-name function)
+                       "helper::helper"))
+        (should (equal (rmsbolt--cargo-asm-function-modules function)
+                       '("helper")))))))
+
+(ert-deftest cargo-asm-item-matching-test ()
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (let* ((items rmsbolt-test--cargo-asm-items)
+         (add (rmsbolt-test--rust-function-at
+               "pub fn add(a: i32, b: i32) -> i32 { a + b }\n" "fn add"))
+         (add-one (rmsbolt-test--rust-function-at
+                   "pub fn add_one(a: i32) -> i32 { a + 1 }\n" "fn add_one"))
+         (generic-add (rmsbolt-test--rust-function-at
+                       "pub fn generic_add<T>(a: T) -> T { a }\n" "fn generic_add"))
+         (foo-bar (rmsbolt-test--rust-function-at
+                   rmsbolt-test--cargo-asm-rust-source "pub fn bar(&self)"))
+         (sub-bar (rmsbolt-test--rust-function-at
+                   "pub fn bar() {}\n" "fn bar"
+                   "/tmp/rmsbolt-cargo-asm-test/src/sub.rs"))
+         (generic-method (rmsbolt-test--rust-function-at
+                          rmsbolt-test--cargo-asm-rust-source "pub fn unwrap_val"))
+         (concrete-method (rmsbolt-test--rust-function-at
+                           rmsbolt-test--cargo-asm-rust-source "pub fn concrete"))
+         (trait-method (rmsbolt-test--rust-function-at
+                        rmsbolt-test--cargo-asm-rust-source
+                        "fn trait_fn(&self) {}")))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list add) items)
+                   '(0)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list add-one) items)
+                   '(1)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list generic-add) items)
+                   '(2 3)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list foo-bar) items)
+                   '(5)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list sub-bar) items)
+                   '(4)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list generic-method) items)
+                   '(6 7)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list concrete-method) items)
+                   '(8)))
+    (should (equal (rmsbolt--cargo-asm-matching-ids (list trait-method) items)
+                   '(9)))
+    ;; A free function name must not match a method or a longer name.
+    (should-not (rmsbolt--cargo-asm-item-matches-p add "demo::add_one"))
+    (should-not (rmsbolt--cargo-asm-item-matches-p add "demo::generic_add::<i32>"))
+    (should-not (rmsbolt--cargo-asm-item-matches-p add "demo::sub::bar"))))
+
+(ert-deftest cargo-asm-process-lines-test ()
+  (let ((src-file "/tmp/rmsbolt-cargo-asm-process/src/lib.rs")
+        (workspace "/tmp/rmsbolt-cargo-asm-process/")
+        (asm (string-join
+              '("\t.intel_syntax noprefix"
+                ".section .text.first,\"ax\",@progbits"
+                "first:"
+                "\t\t// src/lib.rs:2"
+                "\t\tpub fn first() {"
+                "\t.cfi_startproc"
+                "\tpush rax"
+                "\t\t// src/lib.rs:3"
+                "\t\tlet x = 1;"
+                "\tmov eax, 1"
+                "\tret"
+                "\t.cfi_endproc"
+                ".section .text.second,\"ax\",@progbits"
+                "second:"
+                "\t\t// src/lib.rs:10"
+                "\t\tpub fn second() {"
+                "\t.cfi_startproc"
+                "\tpush rbx"
+                "\t\t// src/lib.rs:11"
+                "\t\tlet y = 2;"
+                "\tmov ebx, 2"
+                "\tret"
+                "\t.cfi_endproc"
+                "\t\t// src/other.rs:5"
+                "\t\tlet z = 3;"
+                "\tmov ecx, 3")
+              "\n")))
+    (with-temp-buffer
+      (setq buffer-file-name src-file)
+      (setq-local rmsbolt--cargo-asm-workspace-dir workspace)
+      (insert asm)
+      (rmsbolt--process-cargo-asm-lines (current-buffer))
+      (should (equal
+               (split-string (buffer-string) "\n" t)
+               '("\t.intel_syntax noprefix"
+                 ".section .text.first,\"ax\",@progbits"
+                 "first:"
+                 "\t.cfi_startproc"
+                 "\tpush rax"
+                 "\tmov eax, 1"
+                 "\tret"
+                 "\t.cfi_endproc"
+                 ".section .text.second,\"ax\",@progbits"
+                 "second:"
+                 "\t.cfi_startproc"
+                 "\tpush rbx"
+                 "\tmov ebx, 2"
+                 "\tret"
+                 "\t.cfi_endproc"
+                 "\tmov ecx, 3")))
+      (should-not (string-match-p "^\t\t" (buffer-string)))
+      (should (equal (gethash 3 rmsbolt-line-mapping) '((6 . 7))))
+      (should (equal (gethash 11 rmsbolt-line-mapping) '((13 . 14))))
+      (should-not (gethash 2 rmsbolt-line-mapping))
+      (should-not (gethash 10 rmsbolt-line-mapping))
+      (cl-labels ((line-property (needle)
+                    (goto-char (point-min))
+                    (search-forward needle)
+                    (get-text-property (line-beginning-position)
+                                       'rmsbolt-src-line)))
+        (should (= (line-property "\tmov eax, 1") 3))
+        (should-not (line-property "\tpush rbx"))
+        (should (= (line-property "\tmov ebx, 2") 11))
+        (should-not (line-property "\tmov ecx, 3"))))))
+
+(ert-deftest cargo-asm-end-to-end-test ()
+  (skip-unless (executable-find "cargo-asm"))
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (let* ((root (make-temp-file "rmsbolt-cargo-asm-e2e-" t))
+         (src-dir (expand-file-name "src" root))
+         (manifest (expand-file-name "Cargo.toml" root))
+         (lib-rs (expand-file-name "lib.rs" src-dir))
+         (src-buffer nil))
+    (unwind-protect
+        (progn
+          (make-directory src-dir t)
+          (with-temp-file manifest
+            (insert "[package]\n"
+                    "name = \"rmsbolt_cargo_asm_e2e\"\n"
+                    "version = \"0.1.0\"\n"
+                    "edition = \"2021\"\n"))
+          (with-temp-file lib-rs
+            (insert "#[inline(never)]\n"
+                    "pub fn generic_add<T: std::ops::Add<Output = T>>(a: T, b: T) -> T { a + b }\n"
+                    "\n"
+                    "#[inline(never)]\n"
+                    "pub fn use_i32() -> i32 { generic_add::<i32>(1, 2) }\n"
+                    "\n"
+                    "#[inline(never)]\n"
+                    "pub fn use_u8() -> u8 { generic_add::<u8>(1, 2) }\n"))
+          (setq src-buffer (find-file-noselect lib-rs))
+          (with-current-buffer src-buffer
+            (rust-ts-mode)
+            (goto-char (point-min))
+            (search-forward "fn generic_add")
+            (goto-char (match-beginning 0))
+            (setq-local rmsbolt-compile-arg-overrides "--release")
+            (rmsbolt-cargo-asm)
+            (let ((limit (+ (float-time) 120)))
+              (while (and (< (float-time) limit)
+                          (or (not (get-buffer "*rmsbolt-compilation*"))
+                              (get-buffer-process
+                               (get-buffer "*rmsbolt-compilation*"))
+                              rmsbolt--cargo-asm-active))
+                (accept-process-output nil 0.1))))
+          (let ((output (get-buffer rmsbolt-output-buffer)))
+            (should output)
+            (with-current-buffer output
+              (let ((text (buffer-string)))
+                (should (string-match-p
+                         ";; compiled with: cargo-asm --release" text))
+                (should (string-match-p "generic_add::<i32>" text))
+                (should (string-match-p "generic_add::<u8>" text))))
+            (with-current-buffer src-buffer
+              (should rmsbolt-line-mapping)
+              (let (mapped)
+                (maphash
+                 (lambda (src-line chunks)
+                   (dolist (chunk chunks)
+                     (with-current-buffer output
+                       (goto-char (point-min))
+                       (forward-line (1- (car chunk)))
+                       (should (= (get-text-property
+                                   (line-beginning-position)
+                                   'rmsbolt-src-line)
+                                  src-line)))
+                     (setq mapped t)))
+                 rmsbolt-line-mapping)
+                (should mapped)))))
+      (when (buffer-live-p src-buffer)
+        (kill-buffer src-buffer))
+      (when (get-buffer rmsbolt-output-buffer)
+        (kill-buffer (get-buffer rmsbolt-output-buffer)))
+      (delete-directory root t))))
 
 ;;; rmsbolt-test.el ends here
 (provide 'rmsbolt-test)
