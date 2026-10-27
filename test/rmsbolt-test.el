@@ -1037,6 +1037,20 @@ stored out of order to exercise sorting."
     ((id . 9) (name . "<demo::Foo as demo::MyTrait>::trait_fn")))
   "Fake cargo-asm JSON items for matching tests.")
 
+(defconst rmsbolt-test--cargo-asm-reference-source
+  (concat
+   "pub struct DeserializerFromEvents<'a, 'de>(&'a mut &'de ());\n"
+   "pub trait Deserializer<'de> {\n"
+   "    fn deserialize_any(&mut self);\n"
+   "}\n"
+   "impl<'de> Deserializer<'de> for &mut DeserializerFromEvents<'de, '_> {\n"
+   "    fn deserialize_any(&mut self) {\n"
+   "        fn enum_tag() {}\n"
+   "        enum_tag();\n"
+   "    }\n"
+   "}\n")
+  "Rust source with a reference impl and a nested function.")
+
 (ert-deftest cargo-asm-keybinding-test ()
   (should (eq (lookup-key rmsbolt-mode-map (kbd "C-c C-a"))
               #'rmsbolt-cargo-asm)))
@@ -1180,6 +1194,91 @@ stored out of order to exercise sorting."
     (should-not (rmsbolt--cargo-asm-item-matches-p add "demo::generic_add::<i32>"))
     (should-not (rmsbolt--cargo-asm-item-matches-p add "demo::sub::bar"))))
 
+(ert-deftest cargo-asm-reference-impl-type-test ()
+  (should (equal (rmsbolt--cargo-asm--base-identifier
+                  "&mut DeserializerFromEvents<'de, '_>")
+                 "DeserializerFromEvents"))
+  (should (equal (rmsbolt--cargo-asm--base-identifier
+                  "&'a mut de::DeserializerFromEvents<'de>")
+                 "DeserializerFromEvents"))
+  (should (equal (rmsbolt--cargo-asm--base-identifier "*const de::Foo")
+                 "Foo"))
+  (should (equal (rmsbolt--cargo-asm--base-identifier "*mut de::Foo")
+                 "Foo"))
+  (should (equal (rmsbolt--cargo-asm--normalize-type-string
+                  "&mut dbt_yaml::de::DeserializerFromEvents<'de, '_>")
+                 "dbt_yaml::de::DeserializerFromEvents<'de,'_>"))
+  (let ((parts (rmsbolt--cargo-asm--item-parts
+                (concat "<&mut dbt_yaml::de::DeserializerFromEvents"
+                        "<'de, '_> as serde_core::de::Deserializer>"
+                        "::deserialize_any::enum_tag"))))
+    (should (equal (plist-get parts :type)
+                   "&mut de::DeserializerFromEvents<'de, '_>"))
+    (should (equal (plist-get parts :trait) "de::Deserializer"))
+    (should (equal (plist-get parts :nested) '("deserialize_any")))
+    (should (equal (plist-get parts :method) "enum_tag")))
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (rmsbolt-test--with-rust-buffer rmsbolt-test--cargo-asm-reference-source nil
+    (let* ((functions (rmsbolt--cargo-asm-functions))
+           (method (rmsbolt-test--function-by-display
+                    (concat "<&mut DeserializerFromEvents<'de, '_> as "
+                            "Deserializer<'de>>::deserialize_any")
+                    functions)))
+      (should method)
+      (should (equal (rmsbolt--cargo-asm-function-type-base method)
+                     "DeserializerFromEvents"))
+      (should (equal (rmsbolt--cargo-asm-function-trait-base method)
+                     "Deserializer"))
+      (should-not (rmsbolt--cargo-asm-function-modules method)))))
+
+(ert-deftest cargo-asm-nested-impl-function-test ()
+  (skip-unless (rmsbolt-test--rust-tree-sitter-available-p))
+  (rmsbolt-test--with-rust-buffer rmsbolt-test--cargo-asm-reference-source nil
+    (let* ((functions (rmsbolt--cargo-asm-functions))
+           (display (concat "<&mut DeserializerFromEvents<'de, '_> as "
+                            "Deserializer<'de>>::deserialize_any::enum_tag"))
+           (nested (rmsbolt-test--function-by-display display functions))
+           (method (rmsbolt-test--function-by-display
+                    (concat "<&mut DeserializerFromEvents<'de, '_> as "
+                            "Deserializer<'de>>::deserialize_any")
+                    functions)))
+      (should nested)
+      (should (equal (rmsbolt--cargo-asm-function-name nested) "enum_tag"))
+      (should (equal (rmsbolt--cargo-asm-function-nested nested)
+                     '("deserialize_any")))
+      (should-not (rmsbolt--cargo-asm-function-modules nested))
+      (should (rmsbolt--cargo-asm-item-matches-p
+               nested
+               (concat "<&mut demo::DeserializerFromEvents<'de, '_> as "
+                       "demo::Deserializer<'de>>"
+                       "::deserialize_any::enum_tag")))
+      (should-not (rmsbolt--cargo-asm-item-matches-p
+                   nested
+                   (concat "<&mut demo::DeserializerFromEvents<'de, '_> as "
+                           "demo::Deserializer<'de>>"
+                           "::other_method::enum_tag")))
+      (should (rmsbolt--cargo-asm-item-matches-p
+               method
+               (concat "<&mut demo::DeserializerFromEvents<'de, '_> as "
+                       "demo::Deserializer<'de>>::deserialize_any")))
+      (should-not (rmsbolt--cargo-asm-item-matches-p
+                   method
+                   (concat "<&mut demo::DeserializerFromEvents<'de, '_> as "
+                           "demo::Deserializer<'de>>"
+                           "::other_method::deserialize_any"))))))
+
+(ert-deftest cargo-asm-nested-angle-item-parts-test ()
+  (let* ((name (concat "<<&mut ser::Serializer<_> as serde::Serializer>"
+                       "::serialize_str::InferScalarStyle as Visitor>"
+                       "::expecting"))
+         (parts (rmsbolt--cargo-asm--item-parts name)))
+    (should (equal (plist-get parts :method) "expecting"))
+    (should (equal (plist-get parts :trait) "Visitor"))
+    (should (equal (plist-get parts :type)
+                   (concat "<&mut Serializer<_> as Serializer>"
+                           "::serialize_str::InferScalarStyle")))
+    (should-not (plist-get parts :nested))))
+
 (ert-deftest cargo-asm-process-lines-test ()
   (let ((src-file "/tmp/rmsbolt-cargo-asm-process/src/lib.rs")
         (workspace "/tmp/rmsbolt-cargo-asm-process/")
@@ -1248,6 +1347,66 @@ stored out of order to exercise sorting."
         (should-not (line-property "\tpush rbx"))
         (should (= (line-property "\tmov ebx, 2") 11))
         (should-not (line-property "\tmov ecx, 3"))))))
+
+(defun rmsbolt-test--emacs-executable ()
+  "Return the path of the running Emacs executable."
+  (or (and invocation-directory
+           (expand-file-name invocation-name invocation-directory))
+      (executable-find "emacs")))
+
+(defun rmsbolt-test--rmsbolt-source-file ()
+  "Return the path of the rmsbolt source file."
+  (when-let* ((library (or (locate-library "rmsbolt") load-file-name)))
+    (concat (file-name-sans-extension library) ".el")))
+
+(ert-deftest cargo-asm-byte-compile-test ()
+  (let* ((source (rmsbolt-test--rmsbolt-source-file))
+         (emacs (rmsbolt-test--emacs-executable))
+         (load-dir (and source (file-name-directory source))))
+    (skip-unless (and source (file-exists-p source) emacs))
+    (let* ((dest-dir (make-temp-file "rmsbolt-byte-compile-" t))
+           (dest-elc (expand-file-name "rmsbolt.elc" dest-dir))
+           (log-buffer (generate-new-buffer " *rmsbolt-byte-compile*")))
+      (unwind-protect
+          (progn
+            (should (zerop (call-process
+                            emacs nil log-buffer nil
+                            "-Q" "--batch"
+                            "-L" load-dir
+                            "--eval"
+                            (format
+                             (concat "(setq byte-compile-dest-file-function"
+                                     " (lambda (_) %S))")
+                             dest-elc)
+                            "-f" "batch-byte-compile"
+                            source)))
+            (with-current-buffer log-buffer
+              (should-not (string-match-p "defined too late"
+                                          (buffer-string))))
+            (should (file-exists-p dest-elc))
+            (let ((check-buffer (generate-new-buffer " *rmsbolt-byte-code*")))
+              (unwind-protect
+                  (progn
+                    (should (zerop
+                             (call-process
+                              emacs nil check-buffer nil
+                              "-Q" "--batch"
+                              "-L" load-dir
+                              "-l" dest-elc
+                              "--eval"
+                              (concat
+                               "(unless (string-match-p "
+                               "\"rmsbolt-with-display-buffer-no-window\" "
+                               "(prin1-to-string (symbol-function "
+                               "'rmsbolt--cargo-asm--run))) "
+                               "(kill-emacs 0)) (kill-emacs 1)"))))
+                    (with-current-buffer check-buffer
+                      (should-not (string-match-p "invalid-function"
+                                                  (buffer-string)))))
+                (kill-buffer check-buffer))))
+        (when (buffer-live-p log-buffer)
+          (kill-buffer log-buffer))
+        (delete-directory dest-dir t)))))
 
 (ert-deftest cargo-asm-end-to-end-test ()
   (skip-unless (executable-find "cargo-asm"))

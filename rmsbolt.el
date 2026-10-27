@@ -523,6 +523,17 @@ This function is responsible for calling `rmsbolt--handle-finish-compile'
 Please be careful when setting this, as it bypasses most logic and is
 generally not useful."))
 
+;;;; Macros
+
+(defmacro rmsbolt-with-display-buffer-no-window (&rest body)
+  "Run BODY without displaying any window."
+  ;; See http://debbugs.gnu.org/13594
+  `(let ((display-buffer-overriding-action
+          (if rmsbolt-hide-compile
+              (list #'display-buffer-no-window)
+            display-buffer-overriding-action)))
+     ,@body))
+
 ;;;; Helper Functions
 (defun rmsbolt--convert-file-name-to-system-type (file-name) ;perhaps use `convert-standard-filename'?
   "Convert FILE-NAME to windows format if `system-type' is equal to `cygwin'.
@@ -1547,7 +1558,7 @@ Return t if successful."
 
 (cl-defstruct (rmsbolt--cargo-asm-function
                (:conc-name rmsbolt--cargo-asm-function-))
-  node name display-name modules qualifiers type type-base trait trait-base
+  node name display-name modules nested qualifiers type type-base trait trait-base
   generic-type-p)
 
 (defun rmsbolt--cargo-asm--strip-raw-identifier (name)
@@ -1573,15 +1584,30 @@ Return t if successful."
        ((= depth 0) (push char result))))
     (apply #'string (nreverse result))))
 
+(defun rmsbolt--cargo-asm--strip-type-prefixes (type)
+  "Return TYPE without leading references, lifetimes, or mutability keywords."
+  (let ((type (string-trim type))
+        done)
+    (while (not done)
+      (setq done t)
+      (cond
+       ((string-match "\\`[&*]+[ \t\n\r]*" type)
+        (setq type (substring type (match-end 0)) done nil))
+       ((string-match "\\`'[[:alnum:]_]+[ \t\n\r]*" type)
+        (setq type (substring type (match-end 0)) done nil))
+       ((string-match "\\`\\(?:mut\\|const\\)\\(?:[ \t\n\r]+\\|\\'\\)" type)
+        (setq type (substring type (match-end 0)) done nil))))
+    (string-trim type)))
+
 (defun rmsbolt--cargo-asm--base-identifier (type)
   "Return the base identifier of Rust type TYPE."
-  (let* ((flat (rmsbolt--cargo-asm--strip-angle-groups type))
+  (let* ((flat (rmsbolt--cargo-asm--strip-type-prefixes
+                (rmsbolt--cargo-asm--strip-angle-groups type)))
          (flat (replace-regexp-in-string "[ \t\n\r]+" "" flat))
          (flat (replace-regexp-in-string
                 "\\`\\(?:(?:crate\\|self\\|super)::\\)+" "" flat))
          (base (car (last (split-string flat "::" t)))))
-    (rmsbolt--cargo-asm--strip-raw-identifier
-     (replace-regexp-in-string "\\`[&*]+" "" (or base "")))))
+    (rmsbolt--cargo-asm--strip-raw-identifier (or base ""))))
 
 (defun rmsbolt--cargo-asm--node-name (node)
   "Return the bare name of Rust NODE."
@@ -1640,11 +1666,13 @@ TARGET-SRC is the root source file of the Cargo target."
              (unless impl
                (setq impl parent))))
           (setq parent (treesit-node-parent parent)))
-        (let* ((modules
+        (let* ((base-modules
                 (append (rmsbolt--cargo-asm--file-module-path
                          (buffer-file-name) target-src)
-                        (nreverse mods)
-                        (nreverse function-parents)))
+                        (nreverse mods)))
+               (nested (nreverse function-parents))
+               (modules (if impl base-modules (append base-modules nested)))
+               (nested-path (append (and impl nested) (list name)))
                (type-node (and impl (treesit-node-child-by-field-name impl "type")))
                (trait-node (and impl (treesit-node-child-by-field-name impl "trait")))
                (type-parameters
@@ -1660,12 +1688,14 @@ TARGET-SRC is the root source file of the Cargo target."
                (display-name
                 (cond
                  ((and type trait)
-                  (concat (if modules
-                              (concat (string-join modules "::") "::")
+                  (concat (if base-modules
+                              (concat (string-join base-modules "::") "::")
                             "")
-                          (format "<%s as %s>::%s" type trait name)))
+                          (format "<%s as %s>::%s"
+                                  type trait (string-join nested-path "::"))))
                  (type
-                  (string-join (append modules (list type name)) "::"))
+                  (string-join (append base-modules (list type) nested-path)
+                               "::"))
                  (t
                   (string-join (append modules (list name)) "::"))))
                (type-qualifier (and type
@@ -1680,6 +1710,7 @@ TARGET-SRC is the root source file of the Cargo target."
            :name name
            :display-name display-name
            :modules modules
+           :nested (and impl nested)
            :qualifiers qualifiers
            :type type
            :type-base type-base
@@ -1748,8 +1779,9 @@ TARGET-SRC is the root source file of the Cargo target."
   (let ((name (replace-regexp-in-string (rx "[" (1+ (any "0-9a-f")) "]") "" name)))
     (setq name
           (replace-regexp-in-string
-           (rx (group (or bol "<" " as "))
-               (0+ (any "&*' "))
+           (rx (group (or bol "<" " as ")
+                      (0+ (any "&*' "))
+                      (opt (or "mut" "const") (1+ space)))
                (1+ (or alnum "_")) "::")
            "\\1" name))
     (rmsbolt--cargo-asm--strip-trailing-generics name)))
@@ -1770,8 +1802,27 @@ TARGET-SRC is the root source file of the Cargo target."
       (setq index (1+ index)))
     end))
 
+(defun rmsbolt--cargo-asm--top-level-as-index (string)
+  "Return the index of the first ` as ' in STRING outside angle brackets."
+  (let ((depth 0)
+        (index 0)
+        found)
+    (while (and (< index (length string)) (not found))
+      (let ((char (aref string index)))
+        (cond
+         ((= char ?<) (setq depth (1+ depth)))
+         ((= char ?>)
+          (when (> depth 0)
+            (setq depth (1- depth))))
+         ((and (= depth 0)
+               (<= (+ index 4) (length string))
+               (string= (substring string index (+ index 4)) " as "))
+          (setq found index))))
+      (setq index (1+ index)))
+    found))
+
 (defun rmsbolt--cargo-asm--item-parts (name)
-  "Return the method and qualifiers of cargo-asm item NAME."
+  "Return the method, qualifiers, and parents of cargo-asm item NAME."
   (let ((name (rmsbolt--cargo-asm--normalize-item-name name)))
     (if (not (string-prefix-p "<" name))
         (let* ((parts (split-string name "::" t))
@@ -1781,19 +1832,23 @@ TARGET-SRC is the root source file of the Cargo target."
       (let* ((end (rmsbolt--cargo-asm--matching-angle-end name 0))
              (body (and end (substring name 1 end)))
              (rest (and end (substring name (1+ end))))
-             (method (and rest
-                          (if (string-prefix-p "::" rest)
-                              (substring rest 2)
-                            rest)))
-             (as-index (and body (string-match " as " body))))
+             (segments (and rest
+                            (split-string (string-remove-prefix "::" rest)
+                                          "::" t)))
+             (method (car (last segments)))
+             (nested (butlast segments))
+             (as-index (and body (rmsbolt--cargo-asm--top-level-as-index body))))
         (list :angle t
               :type (and body (if as-index (substring body 0 as-index) body))
               :trait (and as-index (substring body (+ as-index 4)))
+              :nested nested
               :method method)))))
 
 (defun rmsbolt--cargo-asm--normalize-type-string (type)
-  "Return TYPE without whitespace or a leading crate path."
-  (let ((type (replace-regexp-in-string "[ \t\n\r]+" "" type)))
+  "Return TYPE without leading references or a crate path."
+  (let ((type (replace-regexp-in-string
+               "[ \t\n\r]+" ""
+               (rmsbolt--cargo-asm--strip-type-prefixes type))))
     (replace-regexp-in-string
      "\\`\\(?:(?:crate\\|self\\|super)::\\)+" "" type)))
 
@@ -1851,7 +1906,9 @@ TARGET-SRC is the root source file of the Cargo target."
   "Return non-nil if cargo-asm ITEM-NAME matches FUNCTION."
   (let* ((parts (rmsbolt--cargo-asm--item-parts item-name))
          (method (plist-get parts :method)))
-    (when (equal method (rmsbolt--cargo-asm-function-name function))
+    (when (and (equal method (rmsbolt--cargo-asm-function-name function))
+               (equal (plist-get parts :nested)
+                      (rmsbolt--cargo-asm-function-nested function)))
       (if (plist-get parts :angle)
           (and (rmsbolt--cargo-asm--type-matches-p function (plist-get parts :type))
                (rmsbolt--cargo-asm--trait-matches-p function (plist-get parts :trait)))
@@ -2014,7 +2071,11 @@ Argument STOPPED non-nil if the compilation was stopped."
         (cond
          ((eq ids 'error))
          ((not ids)
-          (rmsbolt--reset-default-variables src-buffer)
+          (with-temp-file (rmsbolt-output-filename src-buffer t)
+            (insert (format
+                     ";; No assembly found for `%s' (function may be inlined, unused, or generic).\n"
+                     (rmsbolt--cargo-asm-function-display-name function))))
+          (rmsbolt--handle-finish-compile buffer str)
           (message "RMSBolt: cargo-asm found no matching function for %s"
                    (rmsbolt--cargo-asm-function-display-name function)))
          (t
@@ -2038,7 +2099,8 @@ Argument STOPPED non-nil if the compilation was stopped."
 
 (defun rmsbolt--cargo-asm--prompt (prompt-function functions at-point)
   "Read a function from FUNCTIONS with PROMPT-FUNCTION."
-  (let* ((names (mapcar #'rmsbolt--cargo-asm-function-display-name functions))
+  (let* ((names (delete-dups
+                 (mapcar #'rmsbolt--cargo-asm-function-display-name functions)))
          (default (and at-point
                        (rmsbolt--cargo-asm-function-display-name at-point)))
          (choice (funcall (if (functionp prompt-function)
@@ -2295,17 +2357,6 @@ Interactively, use a prefix argument to select a function."
   ;; so it forces them to require `rmsbolt', which is a bummer.
   "Description of the language tools of current buffer for use by RMSBolt.
 This should be an object of type `rmsbolt-lang', normally set by the major mode")
-
-;;;; Macros
-
-(defmacro rmsbolt-with-display-buffer-no-window (&rest body)
-  "Run BODY without displaying any window."
-  ;; See http://debbugs.gnu.org/13594
-  `(let ((display-buffer-overriding-action
-          (if rmsbolt-hide-compile
-              (list #'display-buffer-no-window)
-            display-buffer-overriding-action)))
-     ,@body))
 
 ;;;; Functions
 ;; Functions to parse and lint assembly were lifted almost directly from the compiler-explorer
