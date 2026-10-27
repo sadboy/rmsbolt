@@ -93,6 +93,7 @@
 
 (require 'rmsbolt-java)
 (require 'rmsbolt-split)
+(require 'treesit nil t)
 
 ;;; Code:
 ;;;; Customize:
@@ -136,10 +137,24 @@ assembly and its interesting arguments, such as optimization levels."
      ("^--target=" . nil))
     (rust-mode
      ("^-O" . nil)
+     ("^--release$" . nil)
+     ("^--dev$" . nil)
+     ("^--profile$" . "^[^-]")
+     ("^--profile=" . nil)
+     ("^--target-cpu$" . "^[^-]")
+     ("^--target-cpu=" . nil)
+     ("^--native$" . nil)
      ("^-C$" . "^\\(opt-level\\|target-cpu\\|target-feature\\|lto\\|llvm-args\\)")
      ("^-C\\(opt-level\\|target-cpu\\|target-feature\\|lto\\|llvm-args\\)" . nil))
     (rustic-mode
      ("^-O" . nil)
+     ("^--release$" . nil)
+     ("^--dev$" . nil)
+     ("^--profile$" . "^[^-]")
+     ("^--profile=" . nil)
+     ("^--target-cpu$" . "^[^-]")
+     ("^--target-cpu=" . nil)
+     ("^--native$" . nil)
      ("^-C$" . "^\\(opt-level\\|target-cpu\\|target-feature\\|lto\\|llvm-args\\)")
      ("^-C\\(opt-level\\|target-cpu\\|target-feature\\|lto\\|llvm-args\\)" . nil))
     (zig-mode
@@ -342,6 +357,18 @@ deleted on Emacs exit.")
   "The directory which rmsbolt is installed to.")
 
 (defvar-local rmsbolt-src-buffer nil)
+
+(defvar-local rmsbolt--cargo-asm-active nil
+  "Non-nil when the output buffer comes from `rmsbolt-cargo-asm'.")
+
+(defvar-local rmsbolt--cargo-asm-workspace-dir nil
+  "Cargo workspace directory for the active `rmsbolt-cargo-asm' output.")
+
+(defvar-local rmsbolt--cargo-asm-function nil
+  "Function descriptor for the active `rmsbolt-cargo-asm' invocation.")
+
+(defvar-local rmsbolt--cargo-asm-command nil
+  "Base cargo-asm command for the active `rmsbolt-cargo-asm' invocation.")
 
 (defvar-local rmsbolt--real-src-file nil
   "The real filename that we compiled from.
@@ -1516,6 +1543,596 @@ Return t if successful."
       (setq-local rmsbolt-command (cl-second to-ret))
       t)))
 
+;;;; Cargo ASM
+
+(cl-defstruct (rmsbolt--cargo-asm-function
+               (:conc-name rmsbolt--cargo-asm-function-))
+  node name display-name modules qualifiers type type-base trait trait-base
+  generic-type-p)
+
+(defun rmsbolt--cargo-asm--strip-raw-identifier (name)
+  "Return NAME without a Rust raw identifier prefix."
+  (if (string-prefix-p "r#" name)
+      (substring name 2)
+    name))
+
+(defun rmsbolt--cargo-asm--trim-type (text)
+  "Return TYPE TEXT with its whitespace runs collapsed."
+  (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " text)))
+
+(defun rmsbolt--cargo-asm--strip-angle-groups (text)
+  "Return TEXT without text inside angle brackets."
+  (let ((depth 0)
+        (result nil))
+    (dolist (char (string-to-list text))
+      (cond
+       ((= char ?<) (setq depth (1+ depth)))
+       ((= char ?>)
+        (when (> depth 0)
+          (setq depth (1- depth))))
+       ((= depth 0) (push char result))))
+    (apply #'string (nreverse result))))
+
+(defun rmsbolt--cargo-asm--base-identifier (type)
+  "Return the base identifier of Rust type TYPE."
+  (let* ((flat (rmsbolt--cargo-asm--strip-angle-groups type))
+         (flat (replace-regexp-in-string "[ \t\n\r]+" "" flat))
+         (flat (replace-regexp-in-string
+                "\\`\\(?:(?:crate\\|self\\|super)::\\)+" "" flat))
+         (base (car (last (split-string flat "::" t)))))
+    (rmsbolt--cargo-asm--strip-raw-identifier
+     (replace-regexp-in-string "\\`[&*]+" "" (or base "")))))
+
+(defun rmsbolt--cargo-asm--node-name (node)
+  "Return the bare name of Rust NODE."
+  (when-let* ((name-node (treesit-node-child-by-field-name node "name")))
+    (rmsbolt--cargo-asm--strip-raw-identifier
+     (treesit-node-text name-node t))))
+
+(defun rmsbolt--cargo-asm--file-module-path (src-file &optional target-src)
+  "Return the module path of SRC-FILE relative to TARGET-SRC.
+A nil result means that SRC-FILE is a crate root."
+  (when src-file
+    (let* ((src-file (file-local-name (expand-file-name src-file)))
+           (target-src (and target-src
+                            (file-local-name (expand-file-name target-src))))
+           (base
+            (cond
+             (target-src
+              (if (member (file-name-nondirectory target-src)
+                          '("lib.rs" "main.rs" "mod.rs"))
+                  (file-name-directory target-src)
+                (file-name-as-directory
+                 (file-name-sans-extension target-src))))
+             ((string-match "\\(?:\\`\\|/\\)src/" src-file)
+              (substring src-file 0 (match-end 0)))))
+           (root-p (or (and target-src (equal src-file target-src))
+                       (member (file-name-nondirectory src-file)
+                               '("lib.rs" "main.rs")))))
+      (when (and (not root-p)
+                 base
+                 (string-prefix-p base src-file))
+        (let* ((relative (file-relative-name src-file base))
+               (parts (split-string
+                       (file-name-sans-extension relative) "/" t)))
+          (if (equal (car (last parts)) "mod")
+              (butlast parts)
+            parts))))))
+
+(defun rmsbolt--cargo-asm--make-function (node &optional target-src)
+  "Return a function descriptor for Rust function NODE.
+TARGET-SRC is the root source file of the Cargo target."
+  (when (equal (treesit-node-type node) "function_item")
+    (when-let* ((name (rmsbolt--cargo-asm--node-name node)))
+      (let ((parent (treesit-node-parent node))
+            mods
+            function-parents
+            impl)
+        (while parent
+          (pcase (treesit-node-type parent)
+            ("mod_item"
+             (when-let* ((mod-name (rmsbolt--cargo-asm--node-name parent)))
+               (push mod-name mods)))
+            ("function_item"
+             (when-let* ((function-name (rmsbolt--cargo-asm--node-name parent)))
+               (push function-name function-parents)))
+            ("impl_item"
+             (unless impl
+               (setq impl parent))))
+          (setq parent (treesit-node-parent parent)))
+        (let* ((modules
+                (append (rmsbolt--cargo-asm--file-module-path
+                         (buffer-file-name) target-src)
+                        (nreverse mods)
+                        (nreverse function-parents)))
+               (type-node (and impl (treesit-node-child-by-field-name impl "type")))
+               (trait-node (and impl (treesit-node-child-by-field-name impl "trait")))
+               (type-parameters
+                (and impl (treesit-node-child-by-field-name impl "type_parameters")))
+               (type (and type-node
+                          (rmsbolt--cargo-asm--trim-type
+                           (treesit-node-text type-node t))))
+               (trait (and trait-node
+                           (rmsbolt--cargo-asm--trim-type
+                            (treesit-node-text trait-node t))))
+               (type-base (and type (rmsbolt--cargo-asm--base-identifier type)))
+               (trait-base (and trait (rmsbolt--cargo-asm--base-identifier trait)))
+               (display-name
+                (cond
+                 ((and type trait)
+                  (concat (if modules
+                              (concat (string-join modules "::") "::")
+                            "")
+                          (format "<%s as %s>::%s" type trait name)))
+                 (type
+                  (string-join (append modules (list type name)) "::"))
+                 (t
+                  (string-join (append modules (list name)) "::"))))
+               (type-qualifier (and type
+                                    (if type-parameters
+                                        (or type-base type)
+                                      type)))
+               (qualifiers (append modules
+                                   (when type-qualifier (list type-qualifier))
+                                   (when trait-base (list trait-base)))))
+          (make-rmsbolt--cargo-asm-function
+           :node node
+           :name name
+           :display-name display-name
+           :modules modules
+           :qualifiers qualifiers
+           :type type
+           :type-base type-base
+           :trait trait
+           :trait-base trait-base
+           :generic-type-p (not (null type-parameters))))))))
+
+(defun rmsbolt--cargo-asm-ensure-parser ()
+  "Make sure that the current buffer has a Rust tree-sitter parser."
+  (when (and (fboundp 'treesit-available-p)
+             (treesit-available-p)
+             (fboundp 'treesit-language-available-p)
+             (treesit-language-available-p 'rust))
+    (or (car (treesit-parser-list nil 'rust))
+        (treesit-parser-create 'rust))))
+
+(defun rmsbolt--cargo-asm-functions (&optional target-src)
+  "Return all Rust functions in the current buffer.
+TARGET-SRC is the root source file of the Cargo target."
+  (let (functions)
+    (when (rmsbolt--cargo-asm-ensure-parser)
+      (dolist (capture
+               (treesit-query-capture (treesit-buffer-root-node)
+                                      "(function_item) @function"))
+        (when (eq (car capture) 'function)
+          (when-let* ((function (rmsbolt--cargo-asm--make-function
+                                 (cdr capture) target-src)))
+            (push function functions)))))
+    (nreverse functions)))
+
+(defun rmsbolt--cargo-asm-function-at-point (&optional target-src)
+  "Return the Rust function at point, or nil.
+TARGET-SRC is the root source file of the Cargo target."
+  (when (and (rmsbolt--cargo-asm-ensure-parser)
+             (fboundp 'treesit-defun-at-point))
+    (let ((treesit-defun-type-regexp "\\`function_item\\'")
+          (treesit-thing-settings nil))
+      (when-let* ((node (treesit-defun-at-point)))
+        (rmsbolt--cargo-asm--make-function node target-src)))))
+
+(defun rmsbolt--cargo-asm--strip-trailing-generics (name)
+  "Remove generic arguments from the end of item NAME."
+  (if (not (string-suffix-p ">" name))
+      name
+    (let ((depth 0)
+          (index (1- (length name)))
+          start)
+      (while (>= index 0)
+        (let ((char (aref name index)))
+          (cond
+           ((= char ?>) (setq depth (1+ depth)))
+           ((= char ?<)
+            (setq depth (1- depth))
+            (when (= depth 0)
+              (setq start index
+                    index -1)))))
+        (setq index (1- index)))
+      (if (and start
+               (> start 1)
+               (string= (substring name (- start 2) start) "::"))
+          (substring name 0 (- start 2))
+        name))))
+
+(defun rmsbolt--cargo-asm--normalize-item-name (name)
+  "Return item NAME in a form that is independent of the crate root."
+  (let ((name (replace-regexp-in-string (rx "[" (1+ (any "0-9a-f")) "]") "" name)))
+    (setq name
+          (replace-regexp-in-string
+           (rx (group (or bol "<" " as "))
+               (0+ (any "&*' "))
+               (1+ (or alnum "_")) "::")
+           "\\1" name))
+    (rmsbolt--cargo-asm--strip-trailing-generics name)))
+
+(defun rmsbolt--cargo-asm--matching-angle-end (string start)
+  "Return the index of the angle that closes the one at START in STRING."
+  (let ((depth 0)
+        (index start)
+        end)
+    (while (and (< index (length string)) (not end))
+      (let ((char (aref string index)))
+        (cond
+         ((= char ?<) (setq depth (1+ depth)))
+         ((= char ?>)
+          (setq depth (1- depth))
+          (when (= depth 0)
+            (setq end index)))))
+      (setq index (1+ index)))
+    end))
+
+(defun rmsbolt--cargo-asm--item-parts (name)
+  "Return the method and qualifiers of cargo-asm item NAME."
+  (let ((name (rmsbolt--cargo-asm--normalize-item-name name)))
+    (if (not (string-prefix-p "<" name))
+        (let* ((parts (split-string name "::" t))
+               (method (car (last parts)))
+               (path (butlast parts)))
+          (list :angle nil :path path :method method))
+      (let* ((end (rmsbolt--cargo-asm--matching-angle-end name 0))
+             (body (and end (substring name 1 end)))
+             (rest (and end (substring name (1+ end))))
+             (method (and rest
+                          (if (string-prefix-p "::" rest)
+                              (substring rest 2)
+                            rest)))
+             (as-index (and body (string-match " as " body))))
+        (list :angle t
+              :type (and body (if as-index (substring body 0 as-index) body))
+              :trait (and as-index (substring body (+ as-index 4)))
+              :method method)))))
+
+(defun rmsbolt--cargo-asm--normalize-type-string (type)
+  "Return TYPE without whitespace or a leading crate path."
+  (let ((type (replace-regexp-in-string "[ \t\n\r]+" "" type)))
+    (replace-regexp-in-string
+     "\\`\\(?:(?:crate\\|self\\|super)::\\)+" "" type)))
+
+(defun rmsbolt--cargo-asm--type-path-parts (type)
+  "Return the module parts and base identifier of TYPE."
+  (let* ((flat (rmsbolt--cargo-asm--strip-angle-groups type))
+         (flat (rmsbolt--cargo-asm--normalize-type-string flat))
+         (parts (split-string flat "::" t)))
+    (cons (butlast parts) (car (last parts)))))
+
+(defun rmsbolt--cargo-asm--descriptor-type-path (function)
+  "Return the expected module parts and base identifier for FUNCTION."
+  (let* ((type (rmsbolt--cargo-asm--normalize-type-string
+                (rmsbolt--cargo-asm-function-type function)))
+         (flat (rmsbolt--cargo-asm--strip-angle-groups type))
+         (parts (split-string flat "::" t))
+         (type-modules (and (cdr parts) (butlast parts))))
+    (cons (or type-modules
+              (rmsbolt--cargo-asm-function-modules function))
+          (or (rmsbolt--cargo-asm-function-type-base function)
+              (car (last parts))))))
+
+(defun rmsbolt--cargo-asm--type-matches-p (function type)
+  "Return non-nil if TYPE matches the impl type of FUNCTION."
+  (when-let* ((desired (rmsbolt--cargo-asm-function-type function)))
+    (let* ((actual (rmsbolt--cargo-asm--normalize-type-string type))
+           (actual-parts (rmsbolt--cargo-asm--type-path-parts type))
+           (actual-modules (car actual-parts))
+           (actual-base (rmsbolt--cargo-asm--base-identifier type))
+           (expected-parts (rmsbolt--cargo-asm--descriptor-type-path function))
+           (expected-modules (car expected-parts))
+           (expected-base (cdr expected-parts)))
+      (if (rmsbolt--cargo-asm-function-generic-type-p function)
+          (and (equal actual-base expected-base)
+               (equal actual-modules expected-modules))
+        (let* ((desired (rmsbolt--cargo-asm--normalize-type-string desired))
+               (flat (rmsbolt--cargo-asm--strip-angle-groups desired))
+               (has-path (string-match-p "::" flat))
+               (modules (rmsbolt--cargo-asm-function-modules function))
+               (expected (cond
+                          (has-path desired)
+                          (modules (concat (string-join modules "::") "::" desired))
+                          (t desired))))
+          (equal actual expected))))))
+
+(defun rmsbolt--cargo-asm--trait-matches-p (function trait)
+  "Return non-nil if TRAIT matches the impl trait of FUNCTION."
+  (let ((desired (rmsbolt--cargo-asm-function-trait-base function)))
+    (if desired
+        (and trait
+             (equal (rmsbolt--cargo-asm--base-identifier trait) desired))
+      (null trait))))
+
+(defun rmsbolt--cargo-asm-item-matches-p (function item-name)
+  "Return non-nil if cargo-asm ITEM-NAME matches FUNCTION."
+  (let* ((parts (rmsbolt--cargo-asm--item-parts item-name))
+         (method (plist-get parts :method)))
+    (when (equal method (rmsbolt--cargo-asm-function-name function))
+      (if (plist-get parts :angle)
+          (and (rmsbolt--cargo-asm--type-matches-p function (plist-get parts :type))
+               (rmsbolt--cargo-asm--trait-matches-p function (plist-get parts :trait)))
+        (and (not (rmsbolt--cargo-asm-function-trait function))
+             (if (rmsbolt--cargo-asm-function-type function)
+                 (rmsbolt--cargo-asm--type-matches-p
+                  function (string-join (plist-get parts :path) "::"))
+               (equal (plist-get parts :path)
+                      (rmsbolt--cargo-asm-function-modules function))))))))
+
+(defun rmsbolt--cargo-asm-matching-ids (functions items)
+  "Return the cargo-asm item ids in ITEMS that match FUNCTIONS."
+  (sort (delete-dups
+         (cl-loop for item in items
+                  for name = (or (alist-get 'name item)
+                                 (alist-get 'full_name item))
+                  when (and name
+                            (cl-some (lambda (function)
+                                       (rmsbolt--cargo-asm-item-matches-p
+                                        function name))
+                                     functions))
+                  collect (alist-get 'id item)))
+        #'<))
+
+(defun rmsbolt--cargo-asm--metadata (manifest-dir)
+  "Return Cargo metadata for MANIFEST-DIR."
+  (or (rmsbolt--cargo-cache-get manifest-dir manifest-dir)
+      (let ((default-directory manifest-dir)
+            (json-object-type 'alist)
+            (json-array-type 'vector)
+            metadata)
+        (with-temp-buffer
+          (unless (zerop (condition-case err
+                             (process-file "cargo" nil t nil
+                                           "metadata" "--no-deps" "--format-version" "1")
+                           (error
+                            (insert (error-message-string err))
+                            1)))
+            (user-error "Cargo metadata failed: %s"
+                        (string-trim (buffer-string))))
+          (goto-char (point-min))
+          (when (re-search-forward "^[[:space:]]*{" nil t)
+            (goto-char (match-beginning 0)))
+          (condition-case err
+              (setq metadata (json-read))
+            (error
+             (user-error "Could not parse Cargo metadata: %s"
+                         (error-message-string err)))))
+        (let* ((remote (file-remote-p manifest-dir))
+               (workspace-root (alist-get 'workspace_root metadata))
+               (workspace-dir (and workspace-root
+                                   (concat remote
+                                           (file-name-as-directory
+                                            workspace-root)))))
+          (rmsbolt--cargo-cache-put manifest-dir manifest-dir
+                                    (or workspace-dir manifest-dir)
+                                    metadata)))))
+
+(defun rmsbolt--cargo-asm--target (src-buffer)
+  "Return workspace directory, package name, and target args for SRC-BUFFER."
+  (let* ((src-file (buffer-file-name src-buffer))
+         (manifest-dir (and src-file
+                            (locate-dominating-file src-file "Cargo.toml"))))
+    (unless manifest-dir
+      (user-error "Buffer is not in a Cargo project"))
+    (let* ((manifest-dir (file-name-as-directory (expand-file-name manifest-dir)))
+           (remote (file-remote-p manifest-dir))
+           (metadata (rmsbolt--cargo-asm--metadata manifest-dir))
+           (workspace-root (alist-get 'workspace_root metadata))
+           (workspace-dir (and workspace-root
+                               (concat remote
+                                       (file-name-as-directory workspace-root))))
+           (match (and workspace-dir
+                       (rmsbolt--cargo-find-target
+                        metadata (file-local-name (expand-file-name src-file)) remote)))
+           (package (car-safe match))
+           (target (cdr-safe match))
+           (package-name (alist-get 'name package))
+           (target-args (and target (rmsbolt--cargo-target-args target)))
+           (target-src (alist-get 'src_path target)))
+      (unless workspace-dir
+        (user-error "Could not find the Cargo workspace root"))
+      (when (or (not package-name)
+                (not target)
+                (rmsbolt--cargo-build-script-p target))
+        (user-error "cargo-asm is not available for build scripts"))
+      (unless target-args
+        (user-error "Could not find a Cargo target for %s" src-file))
+      (list workspace-dir package-name target-args
+            (and target-src
+                 (file-local-name (expand-file-name target-src)))))))
+
+(defun rmsbolt--cargo-asm--base-command (src-buffer package-name target-args)
+  "Return the cargo-asm command for SRC-BUFFER."
+  (let ((parts
+         (append
+          (list "cargo-asm" "-p" package-name)
+          target-args
+          (list (if (equal (buffer-local-value 'rmsbolt-asm-format src-buffer)
+                           "att")
+                    "--att"
+                  "--intel"))
+          (list "--asm")
+          (when (buffer-local-value 'rmsbolt-filter-directives src-buffer)
+            (list "--simplify"))
+          (list (if (buffer-local-value 'rmsbolt-filter-labels src-buffer)
+                    "-R"
+                  "-K"))
+          (list (if (buffer-local-value 'rmsbolt-demangle src-buffer)
+                    "--short-name"
+                  "--keep-mangled")))))
+    (mapconcat #'shell-quote-argument parts " ")))
+
+(defun rmsbolt--cargo-asm--json-items (file)
+  "Return the cargo-asm JSON items in FILE."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (unless (search-forward "[" nil t)
+      (error "cargo-asm did not return JSON"))
+    (goto-char (1- (point)))
+    (let ((json-object-type 'alist)
+          (json-array-type 'list)
+          (json-key-type 'symbol))
+      (json-read))))
+
+(defun rmsbolt--reset-default-variables (src-buffer)
+  "Clean up the default variables in SRC-BUFFER."
+  (with-current-buffer src-buffer
+    (dolist (var rmsbolt--default-variables)
+      (rmsbolt--set-local var nil))
+    (setq rmsbolt--default-variables nil)))
+
+(defun rmsbolt--handle-finish-cargo-asm (buffer str &optional stopped)
+  "Finish hook for cargo-asm compilations.
+Argument BUFFER compilation buffer.
+Argument STR compilation finish status.
+Argument STOPPED non-nil if the compilation was stopped."
+  (let ((src-buffer (buffer-local-value 'rmsbolt-src-buffer buffer))
+        (failed (and str (not (string-match "^finished" str)))))
+    (if (or stopped failed)
+        (rmsbolt--handle-finish-compile buffer str :stopped stopped)
+      (let* ((json-file (expand-file-name "rmsbolt-cargo-asm.json"
+                                          rmsbolt--temp-dir))
+             (function (buffer-local-value 'rmsbolt--cargo-asm-function
+                                           src-buffer))
+             (command (buffer-local-value 'rmsbolt--cargo-asm-command
+                                          src-buffer))
+             (workspace-dir (buffer-local-value
+                             'rmsbolt--cargo-asm-workspace-dir src-buffer))
+             (ids (condition-case err
+                      (rmsbolt--cargo-asm-matching-ids
+                       (list function)
+                       (rmsbolt--cargo-asm--json-items json-file))
+                    (error
+                     (rmsbolt--reset-default-variables src-buffer)
+                     (message "RMSBolt: could not parse cargo-asm JSON: %s"
+                              (error-message-string err))
+                     'error))))
+        (cond
+         ((eq ids 'error))
+         ((not ids)
+          (rmsbolt--reset-default-variables src-buffer)
+          (message "RMSBolt: cargo-asm found no matching function for %s"
+                   (rmsbolt--cargo-asm-function-display-name function)))
+         (t
+          (let* ((output (shell-quote-argument
+                          (file-local-name
+                           (rmsbolt-output-filename src-buffer t))))
+                 (asm-command
+                  (concat command " -q --no-color --rust --this-workspace"))
+                 (shell-command
+                  (concat "status=0; for id in "
+                          (mapconcat (lambda (id) (number-to-string id))
+                                     ids " ")
+                          "; do " asm-command
+                          " \"$id\" || { status=$?; break; }; done > "
+                          output "; exit $status"))
+                 (default-directory workspace-dir)
+                 (shell-file-name (or (executable-find rmsbolt--shell)
+                                      shell-file-name)))
+            (process-file shell-file-name nil nil nil "-c" shell-command)
+            (rmsbolt--handle-finish-compile buffer str))))))))
+
+(defun rmsbolt--cargo-asm--prompt (prompt-function functions at-point)
+  "Read a function from FUNCTIONS with PROMPT-FUNCTION."
+  (let* ((names (mapcar #'rmsbolt--cargo-asm-function-display-name functions))
+         (default (and at-point
+                       (rmsbolt--cargo-asm-function-display-name at-point)))
+         (choice (funcall (if (functionp prompt-function)
+                              prompt-function
+                            #'completing-read)
+                          "Rust function: " names nil t nil nil default)))
+    (cond
+     ((rmsbolt--cargo-asm-function-p choice) choice)
+     ((stringp choice)
+      (or (cl-find choice functions
+                   :key #'rmsbolt--cargo-asm-function-display-name
+                   :test #'equal)
+          (cl-find choice functions
+                   :key #'rmsbolt--cargo-asm-function-name
+                   :test #'equal)
+          (user-error "No such function: %s" choice)))
+     (t (user-error "No function selected")))))
+
+(defun rmsbolt--cargo-asm--run (src-buffer function &optional target)
+  "Run cargo-asm for FUNCTION in SRC-BUFFER.
+TARGET is the Cargo target information from `rmsbolt--cargo-asm--target'."
+  (rmsbolt--stop-running-compilation)
+  (let* ((target (or target (rmsbolt--cargo-asm--target src-buffer)))
+         (workspace-dir (nth 0 target))
+         (package-name (nth 1 target))
+         (target-args (nth 2 target))
+         (base-command (rmsbolt--cargo-asm--base-command
+                        src-buffer package-name target-args))
+         (command (rmsbolt--apply-arg-overrides
+                   base-command
+                   (buffer-local-value 'rmsbolt-compile-arg-overrides src-buffer))))
+    (rmsbolt--gen-temp)
+    (let ((json-file (expand-file-name "rmsbolt-cargo-asm.json"
+                                       rmsbolt--temp-dir)))
+      (with-current-buffer src-buffer
+        (dolist (var '(rmsbolt-command
+                       rmsbolt--cargo-asm-active
+                       rmsbolt--cargo-asm-workspace-dir
+                       rmsbolt--cargo-asm-function
+                       rmsbolt--cargo-asm-command))
+          (add-to-list 'rmsbolt--default-variables var))
+        (setq-local rmsbolt-command base-command)
+        (setq-local rmsbolt--cargo-asm-active t)
+        (setq-local rmsbolt--cargo-asm-workspace-dir workspace-dir)
+        (setq-local rmsbolt--cargo-asm-function function)
+        (setq-local rmsbolt--cargo-asm-command command)
+        (setq rmsbolt-src-buffer src-buffer))
+      (let ((shell-command
+             (concat command " --no-color --json > "
+                     (shell-quote-argument (file-local-name json-file)))))
+        (with-current-buffer
+            (let ((default-directory workspace-dir)
+                  (shell-file-name (or (executable-find rmsbolt--shell)
+                                       shell-file-name))
+                  (compilation-auto-jump-to-first-error t))
+              (rmsbolt-with-display-buffer-no-window
+               (compilation-start shell-command nil
+                                  (lambda (&rest _) "*rmsbolt-compilation*"))))
+          (setq default-directory workspace-dir)
+          (setq-local compilation-skip-threshold 2)
+          (add-hook 'compilation-finish-functions
+                    #'rmsbolt--handle-finish-cargo-asm nil t)
+          (setq rmsbolt-src-buffer src-buffer))))))
+
+;;;###autoload
+(defun rmsbolt-cargo-asm (&optional prompt-function)
+  "Show cargo-asm output for a Rust function at point.
+With PROMPT-FUNCTION, select a function from the current buffer instead.
+Interactively, use a prefix argument to select a function."
+  (interactive (list (when current-prefix-arg #'completing-read)))
+  (when (eq prompt-function t)
+    (setq prompt-function #'completing-read))
+  (let ((src-buffer (or (buffer-base-buffer) (current-buffer))))
+    (with-current-buffer src-buffer
+      (unless rmsbolt-mode
+        (rmsbolt-mode 1))
+      (when (and (buffer-modified-p)
+                 (yes-or-no-p (format "Save buffer %s? " (buffer-name))))
+        (save-buffer))
+      (hack-local-variables)
+      (let* ((target (rmsbolt--cargo-asm--target src-buffer))
+             (target-src (nth 3 target))
+             (at-point (rmsbolt--cargo-asm-function-at-point target-src))
+             (function (if prompt-function
+                           (rmsbolt--cargo-asm--prompt
+                            prompt-function
+                            (rmsbolt--cargo-asm-functions target-src)
+                            at-point)
+                         at-point)))
+        (unless function
+          (user-error "No Rust function at point"))
+        (rmsbolt--cargo-asm--run src-buffer function target)))))
+
+
 ;;;; Language Definitions
 (defvar rmsbolt-languages)
 (setq
@@ -1985,6 +2602,48 @@ Argument SRC-BUFFER source buffer."
                    (put-text-property lbp lep 'rmsbolt-src-line source-linum))
                  :preserve))))))))))
 
+(cl-defun rmsbolt--process-cargo-asm-lines (src-buffer &optional asm-lines)
+  "Process cargo-asm output from SRC-BUFFER or ASM-LINES."
+  (if asm-lines
+      (with-temp-buffer
+        (insert (string-join asm-lines "\n"))
+        (rmsbolt--process-cargo-asm-lines src-buffer)
+        (split-string (buffer-string) "\n" t))
+    (let* ((src-file-name (or (buffer-local-value 'rmsbolt--real-src-file src-buffer)
+                              (buffer-file-name src-buffer)))
+           (local-src-file-name (and src-file-name (file-local-name src-file-name)))
+           (workspace-dir (or (buffer-local-value 'rmsbolt--cargo-asm-workspace-dir src-buffer)
+                              (buffer-local-value 'rmsbolt-default-directory src-buffer)
+                              (buffer-local-value 'default-directory src-buffer)
+                              default-directory))
+           (source-dir (or (and src-file-name (file-name-directory src-file-name))
+                           (buffer-local-value 'default-directory src-buffer)
+                           default-directory))
+           (source-linum nil))
+      (rmsbolt--sweeping src-buffer
+        ((looking-at "^\t\t// \\(.+\\):\\([0-9]+\\)$")
+         (let ((filename (match-string-no-properties 1))
+               (linum (string-to-number (match-string-no-properties 2))))
+           (setq source-linum
+                 (when (or (not local-src-file-name)
+                           (cl-some (lambda (dir)
+                                      (rmsbolt--file-equal-p
+                                       local-src-file-name
+                                       (expand-file-name filename dir)))
+                                    (list workspace-dir source-dir)))
+                   linum)))
+         :kill)
+        ((looking-at-p "^\t\t") :kill)
+        ((or (looking-at-p "^[ \t]*\\.\\(?:section\\|cfi_startproc\\|cfi_endproc\\)\\(?:[ \t]\\|$\\)")
+             (looking-at-p "^[^.\t ][^\n]*:$"))
+         (setq source-linum nil)
+         :preserve)
+        ((and source-linum (looking-at-p "^\t[^\t.]"))
+         (put-text-property (line-beginning-position) (line-end-position)
+                            'rmsbolt-src-line source-linum)
+         :preserve)
+        (t :preserve)))))
+
 (cl-defun rmsbolt--process-php-bytecode (src-buffer asm-lines)
   "Process and filter php ASM-LINES from SRC-BUFFER."
   (if (rmsbolt--hack-p src-buffer)
@@ -2064,6 +2723,8 @@ Argument ASM-LINES input lines."
          (process-asm-fn (when lang
                            (rmsbolt-l-process-asm-custom-fn lang))))
     (cond
+     ((buffer-local-value 'rmsbolt--cargo-asm-active src-buffer)
+      (rmsbolt--process-cargo-asm-lines src-buffer asm-lines))
      (process-asm-fn
       (if asm-lines
           (funcall process-asm-fn src-buffer asm-lines)
@@ -2360,10 +3021,7 @@ Argument STOPPED The compilation was stopped to start another compilation."
       ;; Reset automated recompile
       (setq rmsbolt--automated-compile nil))
     ;; Clear out default-set variables
-    (with-current-buffer src-buffer
-      (dolist (var rmsbolt--default-variables)
-        (rmsbolt--set-local var nil))
-      (setq rmsbolt--default-variables nil))))
+    (rmsbolt--reset-default-variables src-buffer)))
 
 ;;;;; Parsing Options
 (defun rmsbolt--get-lang ()
@@ -2568,7 +3226,7 @@ Interactively, use a prefix argument to be prompted for the arguments."
              (compilation-start cmd nil (lambda (&rest _) "*rmsbolt-compilation*"))))
         ;; Make sure the compilation hooks use the same temporary directory as
         ;; the buffer being compiled.
-        (setq-local default-directory src-default-directory)
+        (setq default-directory src-default-directory)
         ;; Only jump to errors, skip over warnings
         (setq-local compilation-skip-threshold 2)
         (add-hook 'compilation-finish-functions
@@ -2582,7 +3240,12 @@ Interactively, use a prefix argument to be prompted for the arguments."
     (when (eq (process-status proc) 'run)
       (set-process-sentinel proc nil)
       (interrupt-process proc)
-      (rmsbolt--handle-finish-compile compilation-buffer nil :stopped t)
+      (let ((src-buffer (buffer-local-value 'rmsbolt-src-buffer
+                                            compilation-buffer)))
+        (if (and src-buffer
+                 (buffer-local-value 'rmsbolt--cargo-asm-active src-buffer))
+            (rmsbolt--handle-finish-cargo-asm compilation-buffer nil t)
+          (rmsbolt--handle-finish-compile compilation-buffer nil :stopped t)))
       ;; Wait a short while for the process to exit cleanly
       (sit-for 0.2)
       (delete-process proc))))
@@ -2591,6 +3254,7 @@ Interactively, use a prefix argument to be prompted for the arguments."
 (defvar rmsbolt-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'rmsbolt-compile)
+    (define-key map (kbd "C-c C-a") #'rmsbolt-cargo-asm)
     (define-key map (kbd "C-c C-n") #'rmsbolt-output-forward-chunk)
     (define-key map (kbd "C-c C-p") #'rmsbolt-output-backward-chunk)
     map)
