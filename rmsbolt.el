@@ -3426,12 +3426,28 @@ first and last line number in the rmsbolt output buffer."
       (goto-char (point-min))
       (forward-line (1- (car chunk))))))
 
-(defun rmsbolt--output-cycle-chunk (step)
+(defun rmsbolt--output-display-buffer (buffer &optional other)
+  "Display BUFFER in a window when it has no visible window.
+Do not replace the window that shows OTHER."
+  (unless (get-buffer-window buffer 'visible)
+    (with-selected-window (or (get-buffer-window other 'visible)
+                              (selected-window))
+      (display-buffer buffer '(nil (inhibit-same-window . t))))))
+
+(defun rmsbolt--output-display-linked-buffers (src-buffer output-buffer)
+  "Make SRC-BUFFER and OUTPUT-BUFFER visible.
+Display each buffer that has no visible window, so that the source code and
+the assembly chunks are shown together."
+  (rmsbolt--output-display-buffer src-buffer output-buffer)
+  (rmsbolt--output-display-buffer output-buffer src-buffer))
+
+(defun rmsbolt--output-cycle-chunk (step &optional display)
   "Cycle the rmsbolt output focus through the chunks of the current line.
 The current line is the source line at point in the rmsbolt output
 buffer, or the line at point in its source buffer.  STEP is 1 to move to
 the next chunk and -1 to move to the previous one.  Cycling wraps around
-at either end."
+at either end.  When DISPLAY is non-nil, display the source buffer and
+the output buffer if either of them has no visible window."
   (let* ((output-buffer (get-buffer rmsbolt-output-buffer))
          (src-buffer (and output-buffer
                           (buffer-local-value 'rmsbolt-src-buffer output-buffer)))
@@ -3451,6 +3467,8 @@ at either end."
            (chunks (and src-line (rmsbolt--output-chunks src-buffer src-line))))
       (unless chunks
         (user-error "No assembly mapped to the current line"))
+      (when display
+        (rmsbolt--output-display-linked-buffers src-buffer output-buffer))
       (let ((count (length chunks)))
         (if (= count 1)
             (message "Source line %d maps to a single assembly chunk" src-line)
@@ -3469,24 +3487,28 @@ at either end."
                      (1+ next-index) count src-line)))))))
 
 ;;;###autoload
-(defun rmsbolt-output-forward-chunk ()
+(defun rmsbolt-output-forward-chunk (&optional display)
   "Move to the next assembly chunk of the current source line.
 A source line can compile to several disjoint chunks of assembly.  This
 command cycles the rmsbolt output focus through them and wraps around
 after the last chunk.  It works in the output buffer and in the source
-buffer under `rmsbolt-mode'."
-  (interactive)
-  (rmsbolt--output-cycle-chunk 1))
+buffer under `rmsbolt-mode'.  When DISPLAY is non-nil, as it is
+interactively, display the source buffer and the output buffer when
+either of them is not visible."
+  (interactive (list t))
+  (rmsbolt--output-cycle-chunk 1 display))
 
 ;;;###autoload
-(defun rmsbolt-output-backward-chunk ()
+(defun rmsbolt-output-backward-chunk (&optional display)
   "Move to the previous assembly chunk of the current source line.
 A source line can compile to several disjoint chunks of assembly.  This
 command cycles the rmsbolt output focus through them and wraps around
 before the first chunk.  It works in the output buffer and in the source
-buffer under `rmsbolt-mode'."
-  (interactive)
-  (rmsbolt--output-cycle-chunk -1))
+buffer under `rmsbolt-mode'.  When DISPLAY is non-nil, as it is
+interactively, display the source buffer and the output buffer when
+either of them is not visible."
+  (interactive (list t))
+  (rmsbolt--output-cycle-chunk -1 display))
 
 ;;;; Overlay Commands
 (defun rmsbolt--goto-line (line)

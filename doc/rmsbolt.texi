@@ -119,7 +119,8 @@ When a source line compiles to several disjoint regions of assembly, use the
 @code{C-c C-n} (@code{rmsbolt-output-forward-chunk}) and @code{C-c C-p}
 (@code{rmsbolt-output-backward-chunk}) bindings to cycle focus through those
 regions.  The commands work in the output buffer and in the source buffer under
-@code{rmsbolt-mode}, and wrap around at the ends.
+@code{rmsbolt-mode}, and wrap around at the ends.  When either buffer is not
+visible, the commands display it.
 
 @node Configuring
 @chapter Configuring
