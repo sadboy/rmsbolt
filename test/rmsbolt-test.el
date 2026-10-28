@@ -266,6 +266,44 @@ stored out of order to exercise sorting."
                        (line-number-at-pos (window-point output-window)))
                      1)))))))
 
+(ert-deftest output-chunk-displays-both-buffers-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (let ((display-buffer-alist nil)
+          (display-buffer-overriding-action nil)
+          (pop-up-frames nil)
+          (pop-up-windows t))
+      (save-window-excursion
+        ;; A Lisp call without DISPLAY leaves the window layout alone.
+        (delete-other-windows)
+        (switch-to-buffer src-buffer)
+        (goto-char (point-min))
+        (forward-line 4)
+        (should-not (get-buffer-window rmsbolt-output-buffer 'visible))
+        (rmsbolt-output-forward-chunk)
+        (should-not (get-buffer-window rmsbolt-output-buffer 'visible))
+        (with-current-buffer rmsbolt-output-buffer
+          (goto-char (point-min)))
+        ;; The source buffer is visible, the output buffer is not.
+        (call-interactively #'rmsbolt-output-forward-chunk)
+        (should (get-buffer-window src-buffer 'visible))
+        (let ((window (get-buffer-window rmsbolt-output-buffer 'visible)))
+          (should window)
+          (should (= (with-current-buffer rmsbolt-output-buffer
+                       (line-number-at-pos (window-point window)))
+                     6)))
+        ;; The output buffer is visible, the source buffer is not.
+        (delete-other-windows)
+        (switch-to-buffer rmsbolt-output-buffer)
+        (goto-char (point-min))
+        (should-not (get-buffer-window src-buffer 'visible))
+        (call-interactively #'rmsbolt-output-backward-chunk)
+        (should (get-buffer-window src-buffer 'visible))
+        (let ((window (get-buffer-window rmsbolt-output-buffer 'visible)))
+          (should window)
+          (should (= (with-current-buffer rmsbolt-output-buffer
+                       (line-number-at-pos (window-point window)))
+                     6)))))))
+
 (ert-deftest output-chunk-unmapped-position-test ()
   (rmsbolt-test--with-chunk-buffers
     (with-current-buffer rmsbolt-output-buffer

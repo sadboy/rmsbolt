@@ -72,7 +72,8 @@ When a source line compiles to several disjoint regions of assembly, use
 ~C-c C-n~ (~rmsbolt-output-forward-chunk~) and ~C-c C-p~
 (~rmsbolt-output-backward-chunk~) to cycle focus through those regions.  The
 commands work in the output buffer and in the source buffer under
-~rmsbolt-mode~, and wrap around at the ends.
+~rmsbolt-mode~, and wrap around at the ends.  When either buffer is not
+visible, the commands display it.
 
 Run ~rmsbolt-starter~ to generate an example source file for one of the supported languages.
 
