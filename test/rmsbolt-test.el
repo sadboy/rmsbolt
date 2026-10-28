@@ -132,6 +132,7 @@ stored out of order to exercise sorting."
              (erase-buffer)
              (insert "a\nb\nc\nd\ne\nf\ng\nh\n")
              (setq rmsbolt-src-buffer src-buffer)
+             (setq-local rmsbolt-mode t)
              (dolist (chunk '((1 2 5) (4 4 6) (6 7 5)))
                (goto-char (point-min))
                (forward-line (1- (nth 0 chunk)))
@@ -201,14 +202,14 @@ stored out of order to exercise sorting."
         (forward-line 2))
       (rmsbolt-output-forward-chunk)
       (should (= (rmsbolt-test--output-line) 1))
-      ;; A single-chunk source line does not move the focus.
+      ;; A single-chunk source line focuses that chunk.
       (with-current-buffer rmsbolt-output-buffer
         (goto-char (point-min))
         (forward-line 2))
       (goto-char (point-min))
       (forward-line 5)
       (rmsbolt-output-forward-chunk)
-      (should (= (rmsbolt-test--output-line) 3))
+      (should (= (rmsbolt-test--output-line) 4))
       ;; Unmapped source lines signal an error.
       (goto-char (point-min))
       (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
@@ -303,6 +304,54 @@ stored out of order to exercise sorting."
           (should (= (with-current-buffer rmsbolt-output-buffer
                        (line-number-at-pos (window-point window)))
                      6)))))))
+
+(ert-deftest output-chunk-single-chunk-focus-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (save-window-excursion
+      (display-buffer rmsbolt-output-buffer '(nil (inhibit-same-window . t)))
+      (let ((window (get-buffer-window rmsbolt-output-buffer 'visible)))
+        (should window)
+        (with-current-buffer src-buffer
+          (goto-char (point-min))
+          (forward-line 5)
+          (set-window-point window (point-min))
+          (rmsbolt-output-forward-chunk)
+          (should (= (with-current-buffer rmsbolt-output-buffer
+                       (line-number-at-pos (window-point window)))
+                     4))
+          (set-window-point window (point-min))
+          (rmsbolt-output-backward-chunk)
+          (should (= (with-current-buffer rmsbolt-output-buffer
+                       (line-number-at-pos (window-point window)))
+                     4)))))))
+
+(ert-deftest output-chunk-unlinked-buffers-test ()
+  (rmsbolt-test--with-chunk-buffers
+    (let ((display-buffer-alist nil)
+          (display-buffer-overriding-action nil)
+          (pop-up-frames nil)
+          (pop-up-windows t))
+      (save-window-excursion
+        (delete-other-windows)
+        ;; `rmsbolt-mode' is off in the source buffer.
+        (with-current-buffer src-buffer
+          (setq-local rmsbolt-mode nil))
+        (switch-to-buffer rmsbolt-output-buffer)
+        (goto-char (point-min))
+        (should-not (get-buffer-window src-buffer 'visible))
+        (rmsbolt-output-forward-chunk t)
+        (should-not (get-buffer-window src-buffer 'visible))
+        ;; `rmsbolt-mode' is off in the output buffer.
+        (with-current-buffer src-buffer
+          (setq-local rmsbolt-mode t))
+        (with-current-buffer rmsbolt-output-buffer
+          (setq-local rmsbolt-mode nil))
+        (switch-to-buffer src-buffer)
+        (goto-char (point-min))
+        (forward-line 4)
+        (should-not (get-buffer-window rmsbolt-output-buffer 'visible))
+        (rmsbolt-output-forward-chunk t)
+        (should-not (get-buffer-window rmsbolt-output-buffer 'visible))))))
 
 (ert-deftest output-chunk-unmapped-position-test ()
   (rmsbolt-test--with-chunk-buffers

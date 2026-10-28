@@ -73,7 +73,8 @@ When a source line compiles to several disjoint regions of assembly, use
 (~rmsbolt-output-backward-chunk~) to cycle focus through those regions.  The
 commands work in the output buffer and in the source buffer under
 ~rmsbolt-mode~, and wrap around at the ends.  When either buffer is not
-visible, the commands display it.
+visible and both buffers are still linked by ~rmsbolt-mode~, the commands
+display it.
 
 Run ~rmsbolt-starter~ to generate an example source file for one of the supported languages.
 
