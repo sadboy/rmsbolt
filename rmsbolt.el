@@ -3437,9 +3437,13 @@ Do not replace the window that shows OTHER."
 (defun rmsbolt--output-display-linked-buffers (src-buffer output-buffer)
   "Make SRC-BUFFER and OUTPUT-BUFFER visible.
 Display each buffer that has no visible window, so that the source code and
-the assembly chunks are shown together."
-  (rmsbolt--output-display-buffer src-buffer output-buffer)
-  (rmsbolt--output-display-buffer output-buffer src-buffer))
+the assembly chunks are shown together.  Do nothing unless both buffers
+are still linked by `rmsbolt-mode'."
+  (when (and (buffer-live-p src-buffer)
+             (buffer-local-value 'rmsbolt-mode output-buffer)
+             (buffer-local-value 'rmsbolt-mode src-buffer))
+    (rmsbolt--output-display-buffer src-buffer output-buffer)
+    (rmsbolt--output-display-buffer output-buffer src-buffer)))
 
 (defun rmsbolt--output-cycle-chunk (step &optional display)
   "Cycle the rmsbolt output focus through the chunks of the current line.
@@ -3447,7 +3451,8 @@ The current line is the source line at point in the rmsbolt output
 buffer, or the line at point in its source buffer.  STEP is 1 to move to
 the next chunk and -1 to move to the previous one.  Cycling wraps around
 at either end.  When DISPLAY is non-nil, display the source buffer and
-the output buffer if either of them has no visible window."
+the output buffer if either of them has no visible window and both are
+still linked by `rmsbolt-mode'."
   (let* ((output-buffer (get-buffer rmsbolt-output-buffer))
          (src-buffer (and output-buffer
                           (buffer-local-value 'rmsbolt-src-buffer output-buffer)))
@@ -3471,7 +3476,10 @@ the output buffer if either of them has no visible window."
         (rmsbolt--output-display-linked-buffers src-buffer output-buffer))
       (let ((count (length chunks)))
         (if (= count 1)
-            (message "Source line %d maps to a single assembly chunk" src-line)
+            (progn
+              (rmsbolt--output-focus-chunk (car chunks) output-buffer)
+              (message "Source line %d maps to a single assembly chunk"
+                       src-line))
           (let* ((current (rmsbolt--output-chunk-at-line
                            (if in-output
                                (line-number-at-pos)
@@ -3494,7 +3502,8 @@ command cycles the rmsbolt output focus through them and wraps around
 after the last chunk.  It works in the output buffer and in the source
 buffer under `rmsbolt-mode'.  When DISPLAY is non-nil, as it is
 interactively, display the source buffer and the output buffer when
-either of them is not visible."
+either of them is not visible and both are still linked by
+`rmsbolt-mode'."
   (interactive (list t))
   (rmsbolt--output-cycle-chunk 1 display))
 
@@ -3506,7 +3515,8 @@ command cycles the rmsbolt output focus through them and wraps around
 before the first chunk.  It works in the output buffer and in the source
 buffer under `rmsbolt-mode'.  When DISPLAY is non-nil, as it is
 interactively, display the source buffer and the output buffer when
-either of them is not visible."
+either of them is not visible and both are still linked by
+`rmsbolt-mode'."
   (interactive (list t))
   (rmsbolt--output-cycle-chunk -1 display))
 
