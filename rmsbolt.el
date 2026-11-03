@@ -90,6 +90,7 @@
 (require 'disass)
 (require 'json)
 (require 'view)
+(require 'hl-line)
 
 (require 'rmsbolt-java)
 (require 'rmsbolt-split)
@@ -314,8 +315,10 @@ may not be cleared to default as variables are usually."
 ;;;; Faces
 
 (defface rmsbolt-current-line-face
-  '((t (:weight bold :inherit highlight)))
-  "Face to fontify the current line for showing matches."
+  '((t :inherit hl-line))
+  "Face to fontify the current line for showing matches.
+It inherits from `hl-line', which only changes the background, so the
+`font-lock' foreground colors of the highlighted text stay visible."
   :group 'rmsbolt)
 
 ;;;; Variables:
