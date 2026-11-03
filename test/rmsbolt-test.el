@@ -372,6 +372,25 @@ stored out of order to exercise sorting."
       (should-error (rmsbolt-output-forward-chunk) :type 'user-error)
       (should-error (rmsbolt-output-backward-chunk) :type 'user-error))))
 
+;;;; Face tests
+
+(ert-deftest current-line-face-inherits-hl-line-test ()
+  (should (facep 'hl-line))
+  (let ((spec (cdr (car (get 'rmsbolt-current-line-face 'face-defface-spec)))))
+    (should (equal (plist-get spec :inherit) 'hl-line))
+    (should-not (plist-member spec :foreground))
+    (should-not (plist-member spec :weight))))
+
+(ert-deftest setup-overlay-uses-current-line-face-test ()
+  (with-temp-buffer
+    (insert "one\ntwo\n")
+    (let ((overlay (rmsbolt--setup-overlay (point-min) (point-max)
+                                           (current-buffer))))
+      (unwind-protect
+          (should (eq (overlay-get overlay 'face)
+                      'rmsbolt-current-line-face))
+        (delete-overlay overlay)))))
+
 ;;;; Output header tests
 
 (ert-deftest output-header-compiler-name-test ()
